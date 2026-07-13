@@ -352,15 +352,19 @@ button:disabled { opacity: .35; cursor: not-allowed; box-shadow: none; }
 
 #lidar3d {
   position: relative;
+  width: 100%;
   flex: 1;
+  min-width: 0;
   min-height: 0;
+  overflow: hidden;
   cursor: grab;
+  touch-action: none;
   background:
     radial-gradient(circle at 50% 62%, rgba(24, 92, 122, .30), transparent 58%),
     #01070d;
 }
 #lidar3d:active { cursor: grabbing; }
-#lidar3d canvas { display: block; }
+#lidar3d canvas { display: block; width: 100%; height: 100%; }
 .hdr-toggle {
   padding: 1px 7px;
   border: 1px solid var(--line);
@@ -392,7 +396,9 @@ button:disabled { opacity: .35; cursor: not-allowed; box-shadow: none; }
   font-family: var(--mono);
   font-size: 9px;
 }
-.key-scan { color: var(--accent); }
+.key-scan, .key-diag { color: var(--accent); }
+.key-diag.waiting, .key-diag.stale { color: var(--muted); }
+.key-diag.error, .key-diag.empty { color: var(--danger); }
 .key-ring { color: var(--muted); }
 .key-count { color: var(--accent-2); letter-spacing: .5px; }
 /* 点群の高さランプ(app.js の ramp() と対応) */
