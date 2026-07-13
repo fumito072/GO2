@@ -2,137 +2,204 @@
 <html lang="ja">
 <head>
 <meta charset="utf-8">
-<title>GO2 COCKPIT</title>
+<title>GO2 // COCKPIT</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="icon" href="/static/icon.png">
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
 <header id="topbar">
-  <div class="brand">GO2 <span>COCKPIT</span></div>
-  <div class="status-group">
-    <div class="stat"><span class="dot" id="conn-dot"></span><span id="conn-text">接続中…</span></div>
-    <div class="stat" id="mode-badge">--</div>
-    <div class="stat">🔋 <span id="batt">--</span> V</div>
-    <div class="stat">low <span id="lowage">--</span> ms</div>
-    <div class="stat">LiDAR <span id="cloudhz">--</span> Hz</div>
-    <div class="stat">pose: <span id="posesrc">--</span></div>
+  <div class="brand" aria-label="GO2 Cockpit">
+    <span class="brand-go2">GO2</span><span class="brand-slash">//</span><span>COCKPIT</span>
   </div>
+
+  <div class="status-group" role="status" aria-label="システム状態">
+    <div class="stat stat-link">
+      <span class="dot" id="conn-dot"></span>
+      <span class="stat-copy"><small>LINK</small><b id="conn-text">接続中…</b></span>
+    </div>
+    <div class="stat" id="mode-badge">--</div>
+    <div class="stat"><small>BATTERY</small><b><span id="batt">--</span> V</b></div>
+    <div class="stat"><small>LOW STATE</small><b><span id="lowage">--</span> ms</b></div>
+    <div class="stat"><small>LiDAR</small><b><span id="cloudhz">--</span> Hz</b></div>
+    <div class="stat stat-pose"><small>POSE</small><b id="posesrc">--</b></div>
+  </div>
+
   <div class="topbar-actions">
     <label class="arm-switch" title="ONにするまで移動コマンドは送信されません">
       <input type="checkbox" id="arm-toggle">
-      <span class="arm-slider"></span>
+      <span class="arm-slider" aria-hidden="true"></span>
       <span class="arm-label" id="arm-label">DISARMED</span>
     </label>
-    <button id="btn-stop" class="btn-stop" title="移動停止 (Space)">■ 停止</button>
-    <button id="btn-damp" class="btn-damp" title="全関節脱力 — 立っていると崩れます (緊急用)">⚡ DAMP</button>
+    <button type="button" id="btn-stop" class="btn-stop" title="移動停止 (Space)">
+      <span class="safety-icon">■</span><span>STOP</span>
+    </button>
+    <button type="button" id="btn-damp" class="btn-damp" title="全関節脱力 — 立っていると崩れます (緊急用)">
+      <span class="safety-icon">⚡</span><span>DAMP</span>
+    </button>
   </div>
 </header>
 
 <main id="grid">
-  <section class="panel" id="panel-cam">
-    <h2>前面カメラ <span class="sub" id="cam-age"></span></h2>
-    <div class="cam-wrap"><img id="cam" src="/video" alt="camera"></div>
-  </section>
-
-  <section class="panel" id="panel-lidar">
-    <h2>LiDAR 点群 (odom系) <span class="sub">ドラッグ=回転 / ホイール=ズーム</span></h2>
-    <div id="lidar3d"></div>
-  </section>
-
-  <section class="panel" id="panel-hmap">
-    <h2>ハイトマップ <span class="sub" id="hmap-info">8m四方 / 0.1m格子</span></h2>
-    <div class="hmap-wrap">
-      <canvas id="hmap" width="480" height="480"></canvas>
-      <canvas id="hmap-legend" width="46" height="480"></canvas>
-    </div>
-    <div id="stair-bar">
-      <span id="stair-detect">段差: --</span>
-      <label title="カメラ画像をVLMに見せて安全確認してから登る">
-        <input type="checkbox" id="stair-confirm" checked> カメラ確認
-      </label>
-      <label title="連続する階段を登り続ける">
-        <input type="checkbox" id="stair-multi" checked> 連続
-      </label>
-      <button id="btn-stair" title="純正歩容で 整列→接近→登坂 (≤16cm)">🪜 登る(純正)</button>
-      <button id="btn-stair-stop" title="登坂タスク中断">✕</button>
-    </div>
-    <div id="stair-status"></div>
-    <div id="rl-bar">
-      <span class="rl-title">🧠 学習方策(M3)</span>
-      <select id="rl-policy" title="使用する学習済み方策">
-        <option value="wave5">Wave5 (既定/外乱耐性)</option>
-        <option value="wave4">Wave4 (0.23m級)</option>
-      </select>
-      <label title="ON=方策は推論するがモータへ指令を送らない(安全な予行演習)">
-        <input type="checkbox" id="rl-dry" checked> dry-run
-      </label>
-      <button id="btn-rl-climb" title="段差手前まで純正で接近→sport解除→学習方策で登坂 (≤25cm)">🧠 登る(学習)</button>
-      <button id="btn-rl-stop" title="方策を安全停止(Damp)">✕</button>
-      <button id="btn-rl-restore" title="低レベル制御後、純正歩容へ復帰">Sport復帰</button>
-    </div>
-    <div id="rl-status"></div>
-  </section>
-
-  <section class="panel" id="panel-telem">
-    <h2>テレメトリ</h2>
-    <div class="telem-flex">
-      <canvas id="horizon" width="110" height="110" title="姿勢 (roll/pitch)"></canvas>
-      <div class="telem-list">
-        <div>RPY <b id="t-rpy">--</b></div>
-        <div>速度 <b id="t-vel">--</b> m/s</div>
-        <div>位置 <b id="t-pos">--</b> m</div>
-        <div>体高 <b id="t-bh">--</b> m</div>
-        <div>指令 <b id="t-cmd">--</b></div>
+  <div class="grid-row sensors-row">
+    <section class="panel sensor-panel" id="panel-cam">
+      <h2><span>FRONT CAMERA</span><span class="sub"><span id="cam-age"></span> / FWD</span></h2>
+      <div class="cam-wrap">
+        <img id="cam" src="/video" alt="Go2 front camera">
+        <div class="camera-reticle" aria-hidden="true"><i></i><i></i><i></i><i></i><span></span></div>
       </div>
-    </div>
-  </section>
+    </section>
 
-  <section class="panel" id="panel-joints">
-    <h2>関節 (SDK順) <span class="sub">q [rad] / dq [rad/s] / τ [Nm]</span></h2>
-    <table id="joints"><thead>
-      <tr><th>joint</th><th>q</th><th>dq</th><th>τ</th></tr>
-    </thead><tbody></tbody></table>
-  </section>
+    <section class="panel sensor-panel" id="panel-lidar">
+      <h2><span>LiDAR POINT CLOUD</span><span class="sub">DRAG: ORBIT / WHEEL: ZOOM</span></h2>
+      <div id="lidar3d" aria-label="LiDAR 3D point cloud"></div>
+      <div class="sensor-key" aria-hidden="true">
+        <span class="key-safe">● CLEAR</span><span class="key-warn">● OBSERVED</span><span class="key-danger">● OBSTACLE</span>
+      </div>
+    </section>
 
-  <section class="panel" id="panel-ctrl">
-    <h2>操縦 <span class="sub">W/S 前後 A/D 平行 Q/E 旋回 Space 停止</span></h2>
-    <div class="ctrl-body">
-      <div class="pad">
-        <button class="key" data-k="q">Q ⟲</button>
-        <button class="key" data-k="w">W ↑</button>
-        <button class="key" data-k="e">E ⟳</button>
-        <button class="key" data-k="a">A ←</button>
-        <button class="key stopkey" data-k="space">■</button>
-        <button class="key" data-k="d">D →</button>
-        <div></div>
-        <button class="key" data-k="s">S ↓</button>
-        <div></div>
+    <section class="panel sensor-panel" id="panel-hmap">
+      <h2><span>HEIGHT MAP</span><span class="sub" id="hmap-info">8m四方 / 0.1m格子</span></h2>
+      <div class="hmap-wrap">
+        <canvas id="hmap" width="480" height="480"></canvas>
+        <canvas id="hmap-legend" width="46" height="480"></canvas>
       </div>
-      <div class="ctrl-right">
-        <label>速度スケール <span id="scale-val">0.4</span>
-          <input type="range" id="scale" min="0.2" max="1.0" step="0.1" value="0.4">
-        </label>
-        <div class="pose-btns">
-          <button id="btn-standup">立ち上がる</button>
-          <button id="btn-standdown">伏せる</button>
-          <button id="btn-balance">バランス立位</button>
-        </div>
-        <div class="voice-row">
-          <button id="btn-mic" title="押している間だけ録音 → 離すと認識・実行">🎤 押して話す</button>
-          <span id="voice-text"></span>
-        </div>
-        <div class="mission-row">
-          <input id="mission-input" type="text"
-                 placeholder="AI任務: 例「前方に見える階段の前まで行って」(Enterで実行)">
-          <button id="btn-mission-go" title="ClaudeがカメラとLiDARを見ながら遂行します">▶ AI実行</button>
-          <button id="btn-mission-stop" title="ミッション中断">✕</button>
-        </div>
-        <div id="mission-status"></div>
-        <div id="log"></div>
+      <div class="sensor-metrics" aria-label="段差計測値">
+        <div><span>HEIGHT</span><b id="stair-height">--</b></div>
+        <div><span>DISTANCE</span><b id="stair-distance">--</b></div>
+        <div><span>YAW</span><b id="stair-yaw">--</b></div>
+        <div><span>WIDTH</span><b id="stair-width">--</b></div>
+        <div class="hazard-metric"><span>HAZARD</span><b id="stair-hazard" aria-live="polite">SCANNING</b></div>
       </div>
-    </div>
-  </section>
+    </section>
+  </div>
+
+  <div class="grid-row operations-row">
+    <section class="panel" id="panel-telem">
+      <h2><span>ATTITUDE / TELEMETRY</span><span class="sub">10 Hz</span></h2>
+      <div class="telem-flex">
+        <div class="horizon-shell">
+          <canvas id="horizon" width="160" height="160" title="姿勢 (roll/pitch)"></canvas>
+          <span class="horizon-north">N</span>
+        </div>
+        <div class="telem-list">
+          <div><span>ROLL / PITCH / YAW</span><b id="t-rpy">--</b></div>
+          <div><span>VELOCITY</span><b><span id="t-vel">--</span> m/s</b></div>
+          <div><span>POSITION</span><b><span id="t-pos">--</span> m</b></div>
+          <div><span>BODY HEIGHT</span><b><span id="t-bh">--</span> m</b></div>
+          <div><span>COMMAND</span><b id="t-cmd">--</b></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel" id="panel-joints">
+      <h2><span>JOINTS</span><span class="sub">q / dq / τ</span></h2>
+      <div class="table-scroll">
+        <table id="joints">
+          <thead><tr><th>JOINT</th><th>POS</th><th>VEL</th><th>τ</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel" id="panel-ctrl">
+      <h2><span>CONTROL</span><span class="sub">8-WAY + ROTATE</span></h2>
+      <div class="ctrl-body">
+        <div class="pad" aria-label="8方向移動と旋回操作">
+          <div class="move-grid">
+            <button type="button" class="key diagonal" data-keys="w,a" aria-label="左斜め前進" title="W+A 左斜め前進"><span>↖</span><small>W+A</small></button>
+            <button type="button" class="key" data-keys="w" aria-label="前進" title="W 前進"><span>↑</span><small>W</small></button>
+            <button type="button" class="key diagonal" data-keys="w,d" aria-label="右斜め前進" title="W+D 右斜め前進"><span>↗</span><small>W+D</small></button>
+            <button type="button" class="key" data-keys="a" aria-label="左へ平行移動" title="A 左へ平行移動"><span>←</span><small>A</small></button>
+            <button type="button" class="key stopkey" data-keys="space" aria-label="停止" title="Space 停止"><span>■</span><small>STOP</small></button>
+            <button type="button" class="key" data-keys="d" aria-label="右へ平行移動" title="D 右へ平行移動"><span>→</span><small>D</small></button>
+            <button type="button" class="key diagonal" data-keys="s,a" aria-label="左斜め後退" title="S+A 左斜め後退"><span>↙</span><small>S+A</small></button>
+            <button type="button" class="key" data-keys="s" aria-label="後退" title="S 後退"><span>↓</span><small>S</small></button>
+            <button type="button" class="key diagonal" data-keys="s,d" aria-label="右斜め後退" title="S+D 右斜め後退"><span>↘</span><small>S+D</small></button>
+          </div>
+          <div class="rotate-row">
+            <button type="button" class="key rotate-key" data-keys="q" aria-label="左旋回" title="Q 左旋回"><span>↶</span><small>Q ROTATE L</small></button>
+            <button type="button" class="key rotate-key" data-keys="e" aria-label="右旋回" title="E 右旋回"><span>↷</span><small>E ROTATE R</small></button>
+          </div>
+        </div>
+
+        <div class="ctrl-right">
+          <label class="scale-block" for="scale">
+            <span>SPEED SCALE</span><b id="scale-val">0.4</b>
+            <input type="range" id="scale" min="0.2" max="1.0" step="0.1" value="0.4">
+            <span class="scale-range"><small>0.2</small><small>1.0</small></span>
+          </label>
+          <div class="pose-btns" aria-label="姿勢操作">
+            <button type="button" id="btn-standup">STAND</button>
+            <button type="button" id="btn-standdown">CROUCH</button>
+            <button type="button" id="btn-balance">BALANCE</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel" id="panel-tasks">
+      <h2><span>STAIR OPERATIONS</span><span class="sub">NATIVE / M3</span></h2>
+      <div id="stair-bar" class="task-card native-task">
+        <div class="task-card-head">
+          <span class="task-kicker">NATIVE GAIT</span>
+          <span id="stair-detect" aria-live="polite">段差: --</span>
+        </div>
+        <div class="task-options">
+          <label title="カメラ画像をVLMに見せて安全確認してから登る"><input type="checkbox" id="stair-confirm" checked> CAMERA CHECK</label>
+          <label title="連続する階段を登り続ける"><input type="checkbox" id="stair-multi" checked> MULTI STEP</label>
+        </div>
+        <div class="task-actions">
+          <button type="button" id="btn-stair" title="純正歩容で 整列→接近→登坂 (≤16cm)">CLIMB NATIVE</button>
+          <button type="button" id="btn-stair-stop" title="登坂タスク中断">ABORT</button>
+        </div>
+      </div>
+      <div id="stair-status" aria-live="polite"></div>
+
+      <div id="rl-bar" class="task-card learned-task">
+        <div class="task-card-head">
+          <span class="rl-title">LEARNED POLICY / M3</span>
+          <label class="dry-toggle" title="ON=方策は推論するがモータへ指令を送らない"><input type="checkbox" id="rl-dry" checked> DRY RUN</label>
+        </div>
+        <select id="rl-policy" title="使用する学習済み方策">
+          <option value="wave5">Wave5 / disturbance robust</option>
+          <option value="wave4">Wave4 / 0.23m class</option>
+        </select>
+        <div class="task-actions rl-actions">
+          <button type="button" id="btn-rl-climb" title="段差手前まで純正で接近→sport解除→学習方策で登坂 (≤25cm)">EXECUTE M3</button>
+          <button type="button" id="btn-rl-stop" title="方策を安全停止(Damp)">ABORT</button>
+          <button type="button" id="btn-rl-restore" title="低レベル制御後、純正歩容へ復帰">RESTORE SPORT</button>
+        </div>
+      </div>
+      <div id="rl-status" aria-live="polite"></div>
+    </section>
+  </div>
+
+  <div class="grid-row command-row">
+    <section class="panel" id="panel-mission">
+      <h2><span>AI MISSION</span><span class="sub">CAMERA + LiDAR + VLA</span></h2>
+      <div class="mission-layout">
+        <div class="mission-emblem" aria-hidden="true"><b>M3</b><span>VLA READY</span></div>
+        <div class="mission-main">
+          <div class="mission-command-row">
+            <input id="mission-input" type="text" placeholder="任務を入力：例「前方の階段まで移動して登る」">
+            <button type="button" id="btn-mission-go" title="カメラとLiDARを見ながら遂行します">EXECUTE</button>
+            <button type="button" id="btn-mission-stop" title="ミッション中断">CANCEL</button>
+          </div>
+          <div class="voice-row">
+            <button type="button" id="btn-mic" title="押している間だけ録音 → 離すと認識・実行">● PUSH TO TALK</button>
+            <span id="voice-text"></span>
+          </div>
+          <div id="mission-status" aria-live="polite">MISSION IDLE</div>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel" id="panel-log">
+      <h2><span>EVENT LOG</span><span class="sub">LATEST FIRST / MAX 60</span></h2>
+      <div id="log" role="log" aria-live="polite"></div>
+    </section>
+  </div>
 </main>
 
 <script src="/static/three.min.js"></script>

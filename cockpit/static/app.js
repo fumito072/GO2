@@ -163,16 +163,16 @@ function drawHorizon(roll, pitch) {
   ctx.translate(W / 2, H / 2);
   ctx.rotate(-roll);
   const py = pitch * 90;  // 1rad ≈ 90px
-  ctx.fillStyle = "#1d3a5f";
+  ctx.fillStyle = "#123b59";
   ctx.fillRect(-W, -H * 2 + py, W * 2, H * 2);   // 空
-  ctx.fillStyle = "#4a3524";
+  ctx.fillStyle = "#2a251c";
   ctx.fillRect(-W, py, W * 2, H * 2);            // 地面
-  ctx.strokeStyle = "#d7e1ec";
+  ctx.strokeStyle = "#e7f5fb";
   ctx.lineWidth = 1.5;
   ctx.beginPath(); ctx.moveTo(-W, py); ctx.lineTo(W, py); ctx.stroke();
   ctx.restore();
   // 機体シンボル
-  ctx.strokeStyle = "#3ddc97"; ctx.lineWidth = 2;
+  ctx.strokeStyle = "#35d8ff"; ctx.lineWidth = 2;
   ctx.beginPath();
   ctx.moveTo(W / 2 - 22, H / 2); ctx.lineTo(W / 2 - 7, H / 2);
   ctx.moveTo(W / 2 + 7, H / 2); ctx.lineTo(W / 2 + 22, H / 2);
@@ -190,16 +190,16 @@ function initLidar3D() {
   try {
     renderer = new THREE.WebGLRenderer({ antialias: true });
   } catch (e) {
-    box.innerHTML = '<div style="padding:20px;color:#7d8ea3">WebGLが利用できないため3D表示は無効です。<br>ハイトマップ/カメラ/操縦は使用できます。</div>';
+    box.innerHTML = '<div style="padding:20px;color:#86aec2">WebGLが利用できないため3D表示は無効です。<br>ハイトマップ/カメラ/操縦は使用できます。</div>';
     return;
   }
   scene = new THREE.Scene();
-  scene.background = new THREE.Color(0x0a0e13);
+  scene.background = new THREE.Color(0x020a11);
   camera3 = new THREE.PerspectiveCamera(55, 1, 0.1, 200);
   camera3.up.set(0, 0, 1);
   box.appendChild(renderer.domElement);
 
-  const grid = new THREE.GridHelper(20, 20, 0x2a3a4d, 0x18222e);
+  const grid = new THREE.GridHelper(20, 20, 0x315d75, 0x102737);
   grid.rotation.x = Math.PI / 2;  // XY平面(z-up)に
   scene.add(grid);
   scene.add(new THREE.AxesHelper(0.8));
@@ -215,10 +215,10 @@ function initLidar3D() {
   // ロボットマーカー
   robotGroup = new THREE.Group();
   const body = new THREE.Mesh(new THREE.BoxGeometry(0.65, 0.31, 0.22),
-    new THREE.MeshBasicMaterial({ color: 0x3ddc97, wireframe: true }));
+    new THREE.MeshBasicMaterial({ color: 0x43efd0, wireframe: true }));
   robotGroup.add(body);
   const nose = new THREE.Mesh(new THREE.ConeGeometry(0.09, 0.28, 12),
-    new THREE.MeshBasicMaterial({ color: 0xffb020 }));
+    new THREE.MeshBasicMaterial({ color: 0xffad0a }));
   nose.rotation.z = -Math.PI / 2;  // coneは+y向き → +x向きに
   nose.position.x = 0.45;
   robotGroup.add(nose);
@@ -301,7 +301,7 @@ function drawHeightmap() {
   const cv = $("hmap"), ctx = cv.getContext("2d");
   const { n, data, cx, cy, res } = hmap;
   const cell = cv.width / n;
-  ctx.fillStyle = "#10151c";
+  ctx.fillStyle = "#020a11";
   ctx.fillRect(0, 0, cv.width, cv.height);
   // 画面: 上=+x(前方), 左=+y
   for (let i = 0; i < n; i++) {          // i ↔ world x
@@ -320,7 +320,7 @@ function drawHeightmap() {
     const [sx, sy] = toScr(pose[0], pose[1]);
     const yaw = pose[3];
     // 方策の height_scan footprint (body系 x±0.8, y±0.5) を破線で表示
-    ctx.strokeStyle = "#d7e1ec88";
+    ctx.strokeStyle = "#e7f5fb88";
     ctx.setLineDash([4, 4]);
     ctx.beginPath();
     [[0.8, 0.5], [0.8, -0.5], [-0.8, -0.5], [-0.8, 0.5]].forEach(([bx, by], k) => {
@@ -337,7 +337,7 @@ function drawHeightmap() {
     ctx.save();
     ctx.translate(sx, sy);
     ctx.rotate(-yaw);           // 画面上=+x なので -yaw 回転
-    ctx.fillStyle = "#3ddc97";
+    ctx.fillStyle = "#43efd0";
     ctx.beginPath();
     ctx.moveTo(0, -10); ctx.lineTo(6, 8); ctx.lineTo(-6, 8);
     ctx.closePath(); ctx.fill();
@@ -355,7 +355,7 @@ function drawLegend() {
     ctx.fillStyle = `rgb(${c[0]},${c[1]},${c[2]})`;
     ctx.fillRect(0, y, 14, 1);
   }
-  ctx.fillStyle = "#7d8ea3";
+  ctx.fillStyle = "#86aec2";
   ctx.font = "10px monospace";
   ctx.fillText(zRange.hi.toFixed(2), 17, 10);
   ctx.fillText(((zRange.hi + zRange.lo) / 2).toFixed(2), 17, H / 2 + 3);
@@ -382,9 +382,31 @@ $("hmap").addEventListener("mouseleave", () => {
 
 // ---------------- 操縦 ----------------
 const keys = { w: false, a: false, s: false, d: false, q: false, e: false };
+const keyboardKeys = new Set();
+const pointerKeys = new Map();   // pointerId -> Set<key>（マルチタッチ/斜め入力用）
 let lastNonzero = false;
 let voiceCmd = null;   // {vx,vy,wz(単位), until(ms), say} — キー入力があれば無効
 let disarmHintAt = 0;
+
+function syncKeys() {
+  for (const k of Object.keys(keys)) keys[k] = keyboardKeys.has(k);
+  for (const held of pointerKeys.values()) {
+    for (const k of held) keys[k] = true;
+  }
+}
+
+function clearManualInput() {
+  keyboardKeys.clear();
+  pointerKeys.clear();
+  syncKeys();
+}
+
+function buttonKeys(btn) {
+  const raw = btn.dataset.keys || btn.dataset.k || "";
+  return raw.split(",")
+    .map((k) => k.trim().toLowerCase())
+    .filter((k) => Object.prototype.hasOwnProperty.call(keys, k));
+}
 
 function scaleVal() { return parseFloat($("scale").value); }
 $("scale").oninput = () => { $("scale-val").textContent = scaleVal().toFixed(1); };
@@ -396,6 +418,12 @@ function composeCmd() {
     vy: (keys.a ? 0.5 * sc : 0) + (keys.d ? -0.5 * sc : 0),
     wz: (keys.q ? 1.2 * sc : 0) + (keys.e ? -1.2 * sc : 0),
   };
+  // 前進+平行移動でも速度スケールを超えないよう平面速度を正規化する。
+  const planar = Math.hypot(c.vx, c.vy);
+  if (planar > sc && planar > 0) {
+    c.vx *= sc / planar;
+    c.vy *= sc / planar;
+  }
   if (c.vx || c.vy || c.wz) { voiceCmd = null; return c; }  // 手動操作が音声より優先
   if (voiceCmd) {
     const left = (voiceCmd.until - Date.now()) / 1000;
@@ -421,14 +449,17 @@ setInterval(() => {
     send({ type: "cmd", vx: 0, vy: 0, wz: 0 });
     lastNonzero = false;
   }
-  // パッドのハイライト
-  for (const k of Object.keys(keys)) {
-    document.querySelector(`.key[data-k="${k}"]`).classList.toggle("active", keys[k]);
-  }
+  // パッドのハイライト（斜めボタンは構成キーがすべて有効な時だけ点灯）
+  document.querySelectorAll(".pad .key").forEach((btn) => {
+    const held = buttonKeys(btn);
+    const active = held.length > 0 && held.every((k) => keys[k]);
+    btn.classList.toggle("active", active);
+    btn.setAttribute("aria-pressed", String(active));
+  });
 }, 100);
 
 function stopAll() {
-  for (const k of Object.keys(keys)) keys[k] = false;
+  clearManualInput();
   voiceCmd = null;
   $("voice-text").textContent = "";
   send({ type: "mission_stop" });
@@ -455,24 +486,42 @@ window.addEventListener("keydown", (e) => {
   if (e.repeat) return;
   if (e.code === "Space") { e.preventDefault(); stopAll(); return; }
   const k = CODE2KEY[e.code];
-  if (k) { keys[k] = true; hintIfDisarmed(); }
+  if (k) { keyboardKeys.add(k); syncKeys(); hintIfDisarmed(); }
 });
 window.addEventListener("keyup", (e) => {
   const k = CODE2KEY[e.code];
-  if (k) keys[k] = false;
+  if (k) { keyboardKeys.delete(k); syncKeys(); }
 });
 window.addEventListener("blur", () => {   // タブ切替中の押しっぱなし防止
-  for (const k of Object.keys(keys)) keys[k] = false;
+  clearManualInput();
 });
 
 document.querySelectorAll(".pad .key").forEach((btn) => {
-  const k = btn.dataset.k;
-  if (k === "space") { btn.onclick = stopAll; return; }
+  const raw = btn.dataset.keys || btn.dataset.k || "";
+  if (raw.split(",").some((k) => k.trim().toLowerCase() === "space")) {
+    btn.onclick = stopAll;
+    return;
+  }
+  const held = buttonKeys(btn);
+  if (!held.length) return;
   btn.classList.add("needs-arm");
-  btn.addEventListener("pointerdown", (e) => { e.preventDefault(); keys[k] = true; });
+  btn.addEventListener("pointerdown", (e) => {
+    e.preventDefault();
+    pointerKeys.set(e.pointerId, new Set(held));
+    syncKeys();
+  });
   ["pointerup", "pointerleave", "pointercancel"].forEach((ev) =>
-    btn.addEventListener(ev, () => { keys[k] = false; }));
+    btn.addEventListener(ev, (e) => {
+      pointerKeys.delete(e.pointerId);
+      syncKeys();
+    }));
 });
+
+// 要素外で離された場合も必ず解除する（要素側で解除済みならno-op）。
+["pointerup", "pointercancel"].forEach((ev) =>
+  window.addEventListener(ev, (e) => {
+    if (pointerKeys.delete(e.pointerId)) syncKeys();
+  }));
 
 // ---------------- 音声操縦 ----------------
 let mediaStream = null;
@@ -590,12 +639,31 @@ let stairLoggedState = "";
 
 const KIND_LABEL = { none: "なし", step: "段差", stairs: "階段", wall: "壁(登坂不可)", drop: "落差!" };
 
+function updateStairMetrics(s) {
+  const metric = (id, value, suffix = "") => {
+    $(id).textContent = Number.isFinite(value) ? value.toFixed(2) + suffix : "--";
+  };
+  metric("stair-height", s?.height, " m");
+  metric("stair-distance", s?.distance, " m");
+  const yaw = Number.isFinite(s?.yaw_err) ? `${s.yaw_err >= 0 ? "+" : ""}${s.yaw_err.toFixed(2)}` : "--";
+  $("stair-yaw").textContent = yaw;
+  metric("stair-width", s?.width, " m");
+
+  const kind = s?.kind || "none";
+  const hazard = $("stair-hazard");
+  hazard.textContent = kind === "drop" ? "DROP" : kind === "wall" ? "WALL" :
+    (kind === "step" || kind === "stairs") ? "CLEAR" : s ? "NO TARGET" : "SCANNING";
+  hazard.parentElement.classList.toggle("warning", kind === "drop" || kind === "wall");
+}
+
 function renderStair(s, task) {
   const el = $("stair-detect");
-  if (!s) { el.textContent = "段差: --"; el.className = ""; return; }
-  const k = s.kind || "none";
-  el.className = k;
-  if (k === "step" || k === "stairs") {
+  updateStairMetrics(s);
+  const k = s?.kind || "none";
+  el.className = s ? k : "";
+  if (!s) {
+    el.textContent = "段差: --";
+  } else if (k === "step" || k === "stairs") {
     el.textContent = `${KIND_LABEL[k]}: 高さ${s.height.toFixed(2)}m 距離${s.distance.toFixed(2)}m ` +
       `yaw${s.yaw_err >= 0 ? "+" : ""}${s.yaw_err.toFixed(2)} 幅${s.width.toFixed(2)}m`;
   } else if (k === "wall" || k === "drop") {
@@ -603,7 +671,7 @@ function renderStair(s, task) {
   } else {
     el.textContent = "段差: " + (s.reason || "なし");
   }
-  $("btn-stair").disabled = !(k === "step" || k === "stairs");
+  $("btn-stair").disabled = !s || !(k === "step" || k === "stairs");
 
   const ts = $("stair-status");
   if (!task || task.state === "idle") { ts.textContent = ""; ts.className = ""; return; }
@@ -635,7 +703,7 @@ function drawStairOverlay(ctx, toScr) {
                  pose[1] + bx * Math.sin(yaw) + by * Math.cos(yaw));
   };
   const [x1, y1] = p(half), [x2, y2] = p(-half);
-  ctx.strokeStyle = k === "drop" || k === "wall" ? "#ff5d5d" : "#3ddc97";
+  ctx.strokeStyle = k === "drop" || k === "wall" ? "#ff4338" : "#59ef83";
   ctx.lineWidth = 3;
   ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
   ctx.fillStyle = ctx.strokeStyle;
@@ -712,9 +780,14 @@ fetch("/voice/status").then((r) => r.json()).then((d) => {
 $("arm-toggle").onchange = (e) => send({ type: "arm", on: e.target.checked });
 $("btn-stop").onclick = stopAll;
 $("btn-damp").onclick = () => {
+  clearManualInput();
+  voiceCmd = null;
+  lastNonzero = false;
+  $("voice-text").textContent = "";
   send({ type: "cmd", vx: 0, vy: 0, wz: 0 });
+  send({ type: "arm", on: false });
   send({ type: "action", name: "damp" });
-  log("DAMP送信(脱力)", "err");
+  log("DAMP送信 — 入力を解除しDISARMしました", "err");
 };
 $("btn-standup").onclick = () => send({ type: "action", name: "stand_up" });
 $("btn-standdown").onclick = () => send({ type: "action", name: "stand_down" });
