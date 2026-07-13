@@ -242,7 +242,8 @@ button:disabled { opacity: .35; cursor: not-allowed; box-shadow: none; }
 #grid {
   height: calc(100dvh - var(--topbar-h));
   display: grid;
-  grid-template-rows: minmax(290px, 44fr) minmax(225px, 35fr) minmax(135px, 21fr);
+  /* センサー3面(カメラ/LiDAR/ハイトマップ)で画面のおよそ上半分を占める */
+  grid-template-rows: minmax(330px, 52fr) minmax(210px, 32fr) minmax(120px, 16fr);
   gap: var(--gap);
   padding: var(--gap);
   min-height: 0;
@@ -298,6 +299,9 @@ button:disabled { opacity: .35; cursor: not-allowed; box-shadow: none; }
 }
 .panel h2 > span:first-child { overflow: hidden; text-overflow: ellipsis; }
 .panel h2 .sub {
+  display: flex;
+  align-items: center;
+  gap: 6px;
   min-width: 0;
   overflow: hidden;
   color: var(--muted);
@@ -305,6 +309,7 @@ button:disabled { opacity: .35; cursor: not-allowed; box-shadow: none; }
   font-weight: 500;
   letter-spacing: .25px;
   text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* ---------- perception surfaces ---------- */
@@ -319,6 +324,14 @@ button:disabled { opacity: .35; cursor: not-allowed; box-shadow: none; }
   background: #010509;
 }
 #cam { width: 100%; height: 100%; object-fit: contain; }
+.cam-hud {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
 .camera-reticle { position: absolute; inset: 9%; pointer-events: none; opacity: .82; }
 .camera-reticle i { position: absolute; width: 34px; height: 24px; }
 .camera-reticle i:nth-child(1) { top: 0; left: 0; border-top: 1px solid var(--accent-2); border-left: 1px solid var(--accent-2); }
@@ -337,20 +350,55 @@ button:disabled { opacity: .35; cursor: not-allowed; box-shadow: none; }
 .camera-reticle span::before { width: 48px; height: 1px; }
 .camera-reticle span::after { width: 1px; height: 48px; }
 
-#lidar3d { flex: 1; min-height: 0; cursor: grab; background: #020a11; }
+#lidar3d {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  cursor: grab;
+  background:
+    radial-gradient(circle at 50% 62%, rgba(24, 92, 122, .30), transparent 58%),
+    #01070d;
+}
 #lidar3d:active { cursor: grabbing; }
+#lidar3d canvas { display: block; }
+.hdr-toggle {
+  padding: 1px 7px;
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  background: transparent;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: .5px;
+  cursor: pointer;
+}
+.hdr-toggle:hover { border-color: var(--accent); color: var(--text); }
+.hdr-toggle.active {
+  border-color: var(--accent);
+  background: rgba(53, 216, 255, .14);
+  color: var(--accent);
+  box-shadow: 0 0 8px rgba(53, 216, 255, .25) inset;
+}
 .sensor-key {
   height: 25px;
   flex: none;
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 18px;
+  gap: 16px;
   border-top: 1px solid var(--line);
   background: rgba(2, 11, 18, .88);
   font-family: var(--mono);
   font-size: 9px;
 }
+.key-scan { color: var(--accent); }
+.key-ring { color: var(--muted); }
+.key-count { color: var(--accent-2); letter-spacing: .5px; }
+/* 点群の高さランプ(app.js の ramp() と対応) */
+.key-low { color: #1f8fc4; }
+.key-mid { color: #35d8ff; }
+.key-high { color: #eafff9; }
 .key-safe { color: var(--safe); }
 .key-warn { color: var(--warn); }
 .key-danger { color: var(--danger); }

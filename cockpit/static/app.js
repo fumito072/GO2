@@ -25,13 +25,21 @@ function cmap(t) {
 
 // 色スケール範囲(m, odom z)。データの5-95%点へゆっくり追従。
 let zRange = { lo: -0.1, hi: 1.0 };
+const Z_MIN_SPAN = 0.6;   // 平坦な床でノイズが虹色にならないよう色域の最小幅を決める
 function updateZRange(values) {
   if (!values.length) return;
   const s = Array.from(values).sort((a, b) => a - b);
-  const lo = s[Math.floor(s.length * 0.05)], hi = s[Math.floor(s.length * 0.95)];
-  const pad = Math.max(0.15, (hi - lo) * 0.1);
-  zRange.lo += 0.1 * ((lo - pad) - zRange.lo);
-  zRange.hi += 0.1 * ((hi + pad) - zRange.hi);
+  let lo = s[Math.floor(s.length * 0.05)], hi = s[Math.floor(s.length * 0.95)];
+  const pad = Math.max(0.1, (hi - lo) * 0.1);
+  lo -= pad;
+  hi += pad;
+  if (hi - lo < Z_MIN_SPAN) {          // 床だけが見えている間は色を暴れさせない
+    const c = (lo + hi) / 2;
+    lo = c - Z_MIN_SPAN / 2;
+    hi = c + Z_MIN_SPAN / 2;
+  }
+  zRange.lo += 0.1 * (lo - zRange.lo);
+  zRange.hi += 0.1 * (hi - zRange.hi);
 }
 const zNorm = (z) => (z - zRange.lo) / Math.max(0.05, zRange.hi - zRange.lo);
 
@@ -180,37 +188,196 @@ function drawHorizon(roll, pitch) {
   ctx.stroke();
 }
 
-// ---------------- LiDAR 3D (three.js, z-up world座標そのまま) ----------------
-const MAX_PTS = 8000;
+// ---------------- LiDAR レーダー 3D (three.js, z-up world座標そのまま) ----------------
+// L1 の点群は odom(world)系なので、受信した点を「置き換え」ではなく蓄積していけば
+// 走査済みの壁・階段がそのまま形として残る(= コンセプト画のような空間の点群)。
+// 無限に増えないよう VOXEL 単位で重複除去し、上限を超えたら古い点から上書きする。
+// 実機L1(cloud_deskewed)は機体周辺 ~2m の狭いパッチを毎スキャン11k点で返す。
+// 粗いボクセルだと数千点に潰れて形が見えないので、細かめに刻んで密度を稼ぐ。
+const ACC_MAX = 120000;    // 蓄積する点の上限(GPUに載る量。重ければ下げる)
+const VOXEL = 0.025;       // [m] このセルに既に点があれば追加しない
+const RECV_MAX = 8000;     // 1フレームで受け取る最大点数(サーバ側と同じ)
+const KEEP_RADIUS = 10.0;  // [m] 機体からこれ以上離れた点は蓄積しない
+const SWEEP_RATE = 1.5;    // [rad/s] ≒14 RPM
+const SWEEP_SPREAD = 1.0;  // [rad] 尾を引く角度
+const SWEEP_RADIUS = 4.0;  // [m] ビーム/リングの最大半径(実データの広がりに合わせる)
+const PING_PERIOD = 2.6;   // [s] 拡がるピング波の周期
+
 let scene, camera3, renderer, points, robotGroup;
-const orbit = { az: -2.4, el: 0.55, r: 6.0, target: new THREE.Vector3(0, 0, 0) };
+let radarGroup, ringGroup, pingRing, sweepOn = true;
+let sweepAng = 0, lastFrameT = 0;
+const orbit = { az: -2.4, el: 0.55, r: 4.0, target: new THREE.Vector3(0, 0, 0) };
+
+// 蓄積バッファ(リング): voxelキー → スロット。満杯になったら最古スロットを再利用。
+const accSlot = new Map();
+const accKey = new Array(ACC_MAX);
+let accCount = 0, accHead = 0;
+
+// 高さ→色 と スイープ発光 は毎フレームGPU側で計算する(CPUで7万点は塗れない)。
+const PT_VERT = `
+attribute float aBirth;
+uniform vec3 uRobot;
+uniform float uSweep;    // 現在のビーム角 [rad]
+uniform float uSweepOn;  // 0=スイープ無効(蓄積点を等輝度で表示)
+uniform float uSize;     // 点の大きさ [m]
+uniform float uScale;    // 描画バッファ高さ/2 [px] — 距離減衰の基準
+uniform float uTime;
+uniform float uZLo;
+uniform float uZHi;
+varying vec3 vColor;
+varying float vGlow;
+varying float vFlash;
+
+// レーダー用の高さランプ: 低い=深い青 → シアン → 高い=白熱。虹色より空間の形が読める。
+vec3 ramp(float t) {
+  t = clamp(t, 0.0, 1.0);
+  vec3 c0 = vec3(0.031, 0.200, 0.310);   // #08334f 低い(床より下)
+  vec3 c1 = vec3(0.122, 0.560, 0.769);   // #1f8fc4
+  vec3 c2 = vec3(0.208, 0.847, 1.000);   // #35d8ff アクセント
+  vec3 c3 = vec3(0.263, 0.937, 0.816);   // #43efd0 ミント
+  vec3 c4 = vec3(0.918, 1.000, 0.976);   // #eafff9 高い(壁/障害物)
+  if (t < 0.35) return mix(c0, c1, t / 0.35);
+  if (t < 0.60) return mix(c1, c2, (t - 0.35) / 0.25);
+  if (t < 0.82) return mix(c2, c3, (t - 0.60) / 0.22);
+  return mix(c3, c4, (t - 0.82) / 0.18);
+}
+
+void main() {
+  vColor = ramp((position.z - uZLo) / max(0.05, uZHi - uZLo));
+  vec3 d = position - uRobot;
+  float behind = mod(uSweep - atan(d.y, d.x), 6.2831853);  // ビーム通過からの角度
+  float glow = exp(-behind * 1.7);                          // 直後が最大 → 後方へ減衰
+  vGlow = mix(0.75, glow, uSweepOn);
+  vFlash = exp(-(uTime - aBirth) * 4.0);   // 初めて捉えた瞬間の閃光(0.25s程度)
+  vec4 mv = modelViewMatrix * vec4(position, 1.0);
+  // 遠くても消えず、近くても白く潰れないよう上下限で挟む
+  float ps = uSize * (1.0 + 1.0 * vGlow + 0.7 * vFlash) * (uScale / max(0.8, -mv.z));
+  gl_PointSize = clamp(ps, 1.8, 8.0);
+  gl_Position = projectionMatrix * mv;
+}`;
+
+const PT_FRAG = `
+precision mediump float;
+varying vec3 vColor;
+varying float vGlow;
+varying float vFlash;
+void main() {
+  vec2 pc = gl_PointCoord - 0.5;
+  float r = length(pc);
+  if (r > 0.5) discard;
+  float soft = smoothstep(0.5, 0.08, r);                 // 丸くソフトな点
+  vec3 hot = vColor + vec3(0.30, 0.50, 0.65) * vGlow;    // 走査直後は白熱
+  vec3 c = mix(vColor * 0.85, hot, clamp(vGlow * 1.2, 0.0, 1.0));
+  c += vec3(0.35, 0.55, 0.70) * vFlash * 0.5;            // 出現の閃光(控えめに)
+  gl_FragColor = vec4(min(c, vec3(1.0)), soft * (0.5 + 0.5 * vGlow));
+}`;
+
+/** レーダーのスイープ扇形。先端(角度0)が最も明るく、尾に向かって暗くなる。 */
+function makeSweepWedge() {
+  const segs = 36, pos = [], col = [];
+  const base = new THREE.Color(0x35d8ff);
+  for (let i = 0; i < segs; i++) {
+    const a0 = -SWEEP_SPREAD * (i / segs), a1 = -SWEEP_SPREAD * ((i + 1) / segs);
+    const f0 = Math.pow(1 - i / segs, 2.0), f1 = Math.pow(1 - (i + 1) / segs, 2.0);
+    pos.push(0, 0, 0,
+             SWEEP_RADIUS * Math.cos(a0), SWEEP_RADIUS * Math.sin(a0), 0,
+             SWEEP_RADIUS * Math.cos(a1), SWEEP_RADIUS * Math.sin(a1), 0);
+    // 中心は明るく、外周・尾は暗く(加算合成なので色がそのまま強度)
+    const fc = (f0 + f1) / 2;
+    col.push(base.r * 0.5 * fc, base.g * 0.5 * fc, base.b * 0.5 * fc,
+             base.r * 0.26 * f0, base.g * 0.26 * f0, base.b * 0.26 * f0,
+             base.r * 0.26 * f1, base.g * 0.26 * f1, base.b * 0.26 * f1);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
+  g.setAttribute("color", new THREE.Float32BufferAttribute(col, 3));
+  return new THREE.Mesh(g, new THREE.MeshBasicMaterial({
+    vertexColors: true, transparent: true, opacity: 0.9, depthWrite: false,
+    blending: THREE.AdditiveBlending, side: THREE.DoubleSide,
+  }));
+}
+
+function circleGeom(r, segs = 96) {
+  const p = [];
+  for (let i = 0; i < segs; i++) {
+    const a = (i / segs) * Math.PI * 2;
+    p.push(r * Math.cos(a), r * Math.sin(a), 0);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.Float32BufferAttribute(p, 3));
+  return g;
+}
 
 function initLidar3D() {
   const box = $("lidar3d");
   try {
-    renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
   } catch (e) {
     box.innerHTML = '<div style="padding:20px;color:#86aec2">WebGLが利用できないため3D表示は無効です。<br>ハイトマップ/カメラ/操縦は使用できます。</div>';
     return;
   }
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
   scene = new THREE.Scene();
-  scene.background = new THREE.Color(0x020a11);
+  scene.background = new THREE.Color(0x01070d);
+  scene.fog = new THREE.Fog(0x01070d, 9, 26);
   camera3 = new THREE.PerspectiveCamera(55, 1, 0.1, 200);
   camera3.up.set(0, 0, 1);
   box.appendChild(renderer.domElement);
 
-  const grid = new THREE.GridHelper(20, 20, 0x315d75, 0x102737);
+  const grid = new THREE.GridHelper(20, 20, 0x1d4d64, 0x0c2434);
   grid.rotation.x = Math.PI / 2;  // XY平面(z-up)に
+  grid.material.transparent = true;
+  grid.material.opacity = 0.5;
   scene.add(grid);
-  scene.add(new THREE.AxesHelper(0.8));
 
   const geo = new THREE.BufferGeometry();
-  geo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(MAX_PTS * 3), 3));
-  geo.setAttribute("color", new THREE.BufferAttribute(new Float32Array(MAX_PTS * 3), 3));
+  geo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(ACC_MAX * 3), 3));
+  geo.setAttribute("aBirth", new THREE.BufferAttribute(new Float32Array(ACC_MAX), 1));
   geo.setDrawRange(0, 0);
-  points = new THREE.Points(geo, new THREE.PointsMaterial({ size: 0.035, vertexColors: true }));
+  points = new THREE.Points(geo, new THREE.ShaderMaterial({
+    uniforms: {
+      uRobot: { value: new THREE.Vector3() },
+      uSweep: { value: 0 },
+      uSweepOn: { value: 1 },
+      uSize: { value: 0.05 },     // [m]
+      uScale: { value: 300 },     // resize() で実バッファ高さに合わせる
+      uTime: { value: 0 },
+      uZLo: { value: -0.1 },
+      uZHi: { value: 1.0 },
+    },
+    vertexShader: PT_VERT, fragmentShader: PT_FRAG,
+    // 加算合成だと密な点群が白飛びするので通常合成。輝きは色側で表現する。
+    transparent: true, depthWrite: false, blending: THREE.NormalBlending,
+  }));
   points.frustumCulled = false;
   scene.add(points);
+
+  // --- レーダー: 回転するスイープ扇形 + 先端ビーム(ロボット位置に追従) ---
+  radarGroup = new THREE.Group();
+  radarGroup.add(makeSweepWedge());
+  const beamGeo = new THREE.BufferGeometry();
+  beamGeo.setAttribute("position",
+    new THREE.Float32BufferAttribute([0, 0, 0, SWEEP_RADIUS, 0, 0], 3));
+  radarGroup.add(new THREE.Line(beamGeo, new THREE.LineBasicMaterial({
+    color: 0x8df3ff, transparent: true, opacity: 0.75,
+    blending: THREE.AdditiveBlending, depthWrite: false,
+  })));
+  scene.add(radarGroup);
+
+  // --- 距離リング(1m刻み) + 拡がるピング波。回転しないので別グループ ---
+  ringGroup = new THREE.Group();
+  for (let r = 1; r <= 4; r++) {
+    ringGroup.add(new THREE.LineLoop(circleGeom(r), new THREE.LineBasicMaterial({
+      color: r === 4 ? 0x43efd0 : 0x2b6f8c,
+      transparent: true, opacity: r === 4 ? 0.45 : 0.28, depthWrite: false,
+    })));
+  }
+  pingRing = new THREE.LineLoop(circleGeom(1), new THREE.LineBasicMaterial({
+    color: 0x35d8ff, transparent: true, opacity: 0.5,
+    blending: THREE.AdditiveBlending, depthWrite: false,
+  }));
+  ringGroup.add(pingRing);
+  scene.add(ringGroup);
 
   // ロボットマーカー
   robotGroup = new THREE.Group();
@@ -241,13 +408,43 @@ function initLidar3D() {
 
   const resize = () => {
     const w = box.clientWidth, h = box.clientHeight;
-    if (w && h) { renderer.setSize(w, h); camera3.aspect = w / h; camera3.updateProjectionMatrix(); }
+    if (!w || !h) return;
+    renderer.setSize(w, h);
+    camera3.aspect = w / h;
+    camera3.updateProjectionMatrix();
+    points.material.uniforms.uScale.value = renderer.domElement.height / 2;
   };
   new ResizeObserver(resize).observe(box);
   resize();
+  $("sweep-info").textContent = (SWEEP_RATE / (2 * Math.PI) * 60).toFixed(0) + " RPM";
 
-  (function animate() {
+  (function animate(now) {
     requestAnimationFrame(animate);
+    const dt = lastFrameT ? Math.min(0.1, (now - lastFrameT) / 1000) : 0;
+    lastFrameT = now;
+    if (sweepOn) sweepAng = (sweepAng + dt * SWEEP_RATE) % (Math.PI * 2);
+
+    // 地面(足元)にレーダー面を置く。base高から公称の脚長ぶん下げる。
+    const gz = pose ? pose[2] - 0.31 : 0;
+    const u = points.material.uniforms;
+    if (pose) {
+      radarGroup.position.set(pose[0], pose[1], gz + 0.01);
+      ringGroup.position.set(pose[0], pose[1], gz + 0.005);
+      u.uRobot.value.set(pose[0], pose[1], pose[2]);
+    }
+    radarGroup.rotation.z = sweepAng;
+    radarGroup.visible = sweepOn;
+    u.uSweep.value = sweepAng;
+    u.uTime.value = now / 1000;
+    u.uZLo.value = zRange.lo;      // 色スケールは全蓄積点に一括で効く(GPU側で色付け)
+    u.uZHi.value = zRange.hi;
+
+    // ピング波: 周期ごとに 0.3m → SWEEP_RADIUS へ拡がりながら消える
+    const ph = sweepOn ? ((now / 1000) % PING_PERIOD) / PING_PERIOD : 0;
+    pingRing.visible = sweepOn && ph < 0.85;
+    pingRing.scale.setScalar(0.3 + ph * SWEEP_RADIUS);
+    pingRing.material.opacity = 0.45 * Math.max(0, 1 - ph / 0.85);
+
     const t = orbit.target;
     camera3.position.set(
       t.x + orbit.r * Math.cos(orbit.el) * Math.cos(orbit.az),
@@ -255,28 +452,68 @@ function initLidar3D() {
       t.z + orbit.r * Math.sin(orbit.el));
     camera3.lookAt(t);
     renderer.render(scene, camera3);
-  })();
+  })(0);
+}
+
+$("btn-sweep").onclick = () => {
+  sweepOn = !sweepOn;
+  $("btn-sweep").classList.toggle("active", sweepOn);
+  if (points) points.material.uniforms.uSweepOn.value = sweepOn ? 1 : 0;
+  $("sweep-info").textContent = sweepOn
+    ? (SWEEP_RATE / (2 * Math.PI) * 60).toFixed(0) + " RPM" : "STATIC";
+};
+$("btn-clear").onclick = () => {
+  clearCloud();
+  log("LiDAR: 蓄積点群を消去 — 再スキャンします");
+};
+
+function clearCloud() {
+  accSlot.clear();
+  accCount = 0;
+  accHead = 0;
+  if (points) points.geometry.setDrawRange(0, 0);
+  $("pt-count").textContent = "0 PTS";
 }
 
 function onLidar(buf) {
   if (!points) return;  // WebGL無効時
-  const n = Math.min(new DataView(buf).getUint32(1, true), MAX_PTS);
+  const n = Math.min(new DataView(buf).getUint32(1, true), RECV_MAX);
   const xyz = new Float32Array(buf.slice(5, 5 + n * 12));
   const pos = points.geometry.attributes.position.array;
-  const col = points.geometry.attributes.color.array;
+  const birth = points.geometry.attributes.aBirth.array;
   const zs = [];
   for (let i = 0; i < n; i++) zs.push(xyz[i * 3 + 2]);
   updateZRange(zs);
+
+  const now = performance.now() / 1000;
+  const px = pose ? pose[0] : 0, py = pose ? pose[1] : 0;
+  const inv = 1 / VOXEL;
   for (let i = 0; i < n; i++) {
-    pos[i * 3] = xyz[i * 3];
-    pos[i * 3 + 1] = xyz[i * 3 + 1];
-    pos[i * 3 + 2] = xyz[i * 3 + 2];
-    const c = cmap(zNorm(xyz[i * 3 + 2]));
-    col[i * 3] = c[0] / 255; col[i * 3 + 1] = c[1] / 255; col[i * 3 + 2] = c[2] / 255;
+    const x = xyz[i * 3], y = xyz[i * 3 + 1], z = xyz[i * 3 + 2];
+    if ((x - px) ** 2 + (y - py) ** 2 > KEEP_RADIUS * KEEP_RADIUS) continue;
+    // 同じボクセルに既に点があれば捨てる(壁が厚くならず、点数も発散しない)。
+    // odom座標は歩くほど大きくなるので、衝突しない一意キーにする(±1400m まで安全)。
+    const ix = Math.round(x * inv) + 32768;
+    const iy = Math.round(y * inv) + 32768;
+    const iz = Math.round(z * inv) + 512;
+    const key = (ix * 65536 + iy) * 1024 + iz;
+    if (accSlot.has(key)) continue;
+    const slot = accHead;
+    if (accCount === ACC_MAX) accSlot.delete(accKey[slot]);   // 最古の点を追い出す
+    pos[slot * 3] = x;
+    pos[slot * 3 + 1] = y;
+    pos[slot * 3 + 2] = z;
+    birth[slot] = now;
+    accSlot.set(key, slot);
+    accKey[slot] = key;
+    accHead = (accHead + 1) % ACC_MAX;
+    accCount = Math.min(accCount + 1, ACC_MAX);
   }
-  points.geometry.setDrawRange(0, n);
+  points.geometry.setDrawRange(0, accCount);
   points.geometry.attributes.position.needsUpdate = true;
-  points.geometry.attributes.color.needsUpdate = true;
+  points.geometry.attributes.aBirth.needsUpdate = true;
+  $("pt-count").textContent = (accCount >= 10000
+    ? (accCount / 1000).toFixed(1) + "k" : accCount) + " PTS";
 }
 
 function updateRobotMarker() {
@@ -286,6 +523,169 @@ function updateRobotMarker() {
   // カメラ追従(ゆっくり)
   orbit.target.lerp(new THREE.Vector3(pose[0], pose[1], pose[2]), 0.06);
 }
+
+// ---------------- カメラHUD (高度テープ / ピッチテープ) ----------------
+// 高度 = pose[2] (odom base z)。段差を検出していれば「登り切った後の高さ」を目標として出す。
+const hudCv = $("cam-hud");
+const hudCtx = hudCv.getContext("2d");
+let hudW = 0, hudH = 0;
+let hudAlt = null, hudPitch = 0, hudRoll = 0;   // 表示用の平滑値
+
+function resizeHud() {
+  const box = $("cam-wrap");
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  hudW = box.clientWidth;
+  hudH = box.clientHeight;
+  hudCv.width = Math.round(hudW * dpr);
+  hudCv.height = Math.round(hudH * dpr);
+  hudCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+new ResizeObserver(resizeHud).observe($("cam-wrap"));
+resizeHud();
+
+/** 縦の目盛テープ。中央=現在値、上ほど大。 */
+function drawTape(ctx, o) {
+  const { x, cy, h, value, step, majorEvery, span, unit, digits, label, side } = o;
+  const pxPerUnit = h / span;
+  const dir = side === "right" ? 1 : -1;   // 目盛が伸びる向き
+  ctx.save();
+  ctx.font = "10px ui-monospace, monospace";
+  ctx.textBaseline = "middle";
+
+  // 軸
+  const grad = ctx.createLinearGradient(0, cy - h / 2, 0, cy + h / 2);
+  grad.addColorStop(0, "rgba(53,216,255,0)");
+  grad.addColorStop(0.5, "rgba(53,216,255,.75)");
+  grad.addColorStop(1, "rgba(53,216,255,0)");
+  ctx.strokeStyle = grad;
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(x, cy - h / 2); ctx.lineTo(x, cy + h / 2);
+  ctx.stroke();
+
+  // ラベル
+  ctx.fillStyle = "rgba(134,174,194,.9)";
+  ctx.textAlign = side === "right" ? "left" : "right";
+  ctx.fillText(label, x + dir * 4, cy - h / 2 - 11);
+
+  if (value == null) {
+    ctx.fillStyle = "rgba(134,174,194,.6)";
+    ctx.fillText("--", x + dir * 8, cy);
+    ctx.restore();
+    return;
+  }
+
+  // 目盛
+  const lo = value - span / 2, hi = value + span / 2;
+  const i0 = Math.ceil(lo / step);
+  for (let i = i0; i * step <= hi; i++) {
+    const v = i * step;
+    const y = cy - (v - value) * pxPerUnit;
+    const major = i % majorEvery === 0;
+    const fade = 1 - Math.min(1, Math.abs(y - cy) / (h / 2)) * 0.75;
+    ctx.strokeStyle = `rgba(134,174,194,${(major ? 0.95 : 0.5) * fade})`;
+    ctx.lineWidth = major ? 1.4 : 1;
+    ctx.beginPath();
+    ctx.moveTo(x, y);
+    ctx.lineTo(x + dir * (major ? 11 : 6), y);
+    ctx.stroke();
+    if (major) {
+      ctx.fillStyle = `rgba(207,233,245,${0.95 * fade})`;
+      ctx.textAlign = side === "right" ? "left" : "right";
+      ctx.fillText(v.toFixed(digits), x + dir * 15, y);
+    }
+  }
+
+  // 現在値の読み取り窓
+  const bw = 58, bh = 19;
+  const bx = side === "right" ? x - bw - 5 : x + 5;
+  ctx.fillStyle = "rgba(3,16,26,.86)";
+  ctx.strokeStyle = "#35d8ff";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.rect(bx, cy - bh / 2, bw, bh);
+  ctx.fill();
+  ctx.stroke();
+  ctx.beginPath();   // 軸を指す三角
+  const tipX = side === "right" ? bx + bw : bx;
+  ctx.moveTo(tipX, cy - 5); ctx.lineTo(tipX + dir * 6, cy); ctx.lineTo(tipX, cy + 5);
+  ctx.closePath();
+  ctx.fillStyle = "#35d8ff";
+  ctx.fill();
+  ctx.fillStyle = "#e7f5fb";
+  ctx.textAlign = "center";
+  ctx.font = "bold 12px ui-monospace, monospace";
+  ctx.fillText(value.toFixed(digits) + unit, bx + bw / 2, cy + 1);
+  ctx.restore();
+}
+
+/** テープ上の任意の値に印を付ける(GND / 段差の頂点)。 */
+function tapeMark(ctx, x, cy, h, span, value, at, color, text) {
+  const y = cy - (at - value) * (h / span);
+  if (y < cy - h / 2 - 2 || y > cy + h / 2 + 2) return;
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.fillStyle = color;
+  ctx.lineWidth = 1.5;
+  ctx.setLineDash([5, 3]);
+  ctx.beginPath();
+  ctx.moveTo(x - 26, y); ctx.lineTo(x, y);
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.font = "9px ui-monospace, monospace";
+  ctx.textAlign = "right";
+  ctx.textBaseline = "bottom";
+  ctx.fillText(text, x - 2, y - 2);
+  ctx.restore();
+}
+
+function drawCamHud() {
+  requestAnimationFrame(drawCamHud);
+  if (!hudW || !hudH) return;
+  const ctx = hudCtx;
+  ctx.clearRect(0, 0, hudW, hudH);
+  if (hudW < 300 || hudH < 190) return;   // 狭すぎる時はHUDを出さない
+
+  // 平滑化(テレメトリは10Hz、描画は60Hz)
+  const altT = pose ? pose[2] : null;
+  if (altT != null) hudAlt = hudAlt == null ? altT : hudAlt + 0.18 * (altT - hudAlt);
+  const rpy = telem.rpy || [0, 0, 0];
+  hudPitch += 0.18 * (rpy[1] * 57.296 - hudPitch);
+  hudRoll += 0.18 * (rpy[0] * 57.296 - hudRoll);
+
+  const cy = hudH / 2;
+  const h = Math.min(hudH - 66, 300);
+  const xR = hudW - 56;   // 右: 高度
+  const xL = 56;          // 左: ピッチ
+
+  const ALT_SPAN = 0.9;   // ±0.45 m
+  drawTape(ctx, { x: xR, cy, h, value: hudAlt, step: 0.05, majorEvery: 2,
+                  span: ALT_SPAN, unit: "", digits: 2, label: "ALT m", side: "right" });
+  if (hudAlt != null) {
+    // 段差の頂点(登り切ったときのbase高) と odom原点(GND)
+    if (stair && (stair.kind === "step" || stair.kind === "stairs") && stair.height) {
+      tapeMark(ctx, xR, cy, h, ALT_SPAN, hudAlt, hudAlt + stair.height, "#ffad0a",
+               "STEP +" + stair.height.toFixed(2));
+    }
+    // odom原点の平面 = オドメトリ開始時の床。登った量はこの線との差で読める。
+    tapeMark(ctx, xR, cy, h, ALT_SPAN, hudAlt, 0.0, "rgba(89,239,131,.85)", "FLOOR 0");
+  }
+  drawTape(ctx, { x: xL, cy, h, value: pose ? hudPitch : null, step: 2.5, majorEvery: 4,
+                  span: 45, unit: "", digits: 0, label: "PITCH °", side: "left" });
+
+  // ロールを示す水平基準線(中央、機体シンボルの左右)
+  ctx.save();
+  ctx.translate(hudW / 2, cy);
+  ctx.rotate(-hudRoll * Math.PI / 180);
+  ctx.strokeStyle = "rgba(67,239,208,.55)";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(-70, 0); ctx.lineTo(-30, 0);
+  ctx.moveTo(30, 0); ctx.lineTo(70, 0);
+  ctx.stroke();
+  ctx.restore();
+}
+drawCamHud();
 
 // ---------------- ハイトマップ ----------------
 function onHeightmap(buf) {

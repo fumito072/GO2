@@ -43,18 +43,26 @@
 <main id="grid">
   <div class="grid-row sensors-row">
     <section class="panel sensor-panel" id="panel-cam">
-      <h2><span>FRONT CAMERA</span><span class="sub"><span id="cam-age"></span> / FWD</span></h2>
-      <div class="cam-wrap">
+      <h2><span>FRONT CAMERA</span><span class="sub"><span id="cam-age"></span> / FWD / HUD</span></h2>
+      <div class="cam-wrap" id="cam-wrap">
         <img id="cam" src="/video" alt="Go2 front camera">
+        <canvas id="cam-hud" class="cam-hud" aria-hidden="true"></canvas>
         <div class="camera-reticle" aria-hidden="true"><i></i><i></i><i></i><i></i><span></span></div>
       </div>
     </section>
 
     <section class="panel sensor-panel" id="panel-lidar">
-      <h2><span>LiDAR POINT CLOUD</span><span class="sub">DRAG: ORBIT / WHEEL: ZOOM</span></h2>
+      <h2>
+        <span>LiDAR RADAR</span>
+        <span class="sub">
+          <button type="button" id="btn-sweep" class="hdr-toggle active" title="レーダースイープ表示のON/OFF">SWEEP</button>
+          <button type="button" id="btn-clear" class="hdr-toggle" title="蓄積した点群を消去して再スキャン">CLEAR</button>
+          <span id="sweep-info">-- RPM</span>
+        </span>
+      </h2>
       <div id="lidar3d" aria-label="LiDAR 3D point cloud"></div>
       <div class="sensor-key" aria-hidden="true">
-        <span class="key-safe">● CLEAR</span><span class="key-warn">● OBSERVED</span><span class="key-danger">● OBSTACLE</span>
+        <span class="key-scan">◤ SWEEP</span><span class="key-low">● LOW</span><span class="key-mid">● MID</span><span class="key-high">● HIGH</span><span class="key-ring">○ RANGE 1 m</span><span class="key-count" id="pt-count">0 PTS</span>
       </div>
     </section>
 
