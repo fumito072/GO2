@@ -85,20 +85,58 @@ class RollingElevationMap:
 
 
 def parse_pointcloud2(msg):
-    """sensor_msgs/PointCloud2 → (N,3) float32。x,y,z は float32 前提。"""
-    offs = {}
-    for f in msg.fields:
-        offs[f.name] = f.offset
-    step = msg.point_step
+    """sensor_msgs/PointCloud2 → finite な ``(N, 3) float32``。
+
+    Unitree L1 の通常データは little-endian / float32 / 非 organized だが、
+    PointCloud2 の契約どおり row padding・big endian・float64 field も扱う。
+    壊れたメッセージは黙って偽点へ変換せず ``ValueError`` にする。
+    """
+    fields = {str(f.name): f for f in msg.fields}
+    missing = [name for name in ("x", "y", "z") if name not in fields]
+    if missing:
+        raise ValueError("PointCloud2 に field がありません: %s" % ",".join(missing))
+
+    step = int(msg.point_step)
+    if step <= 0:
+        raise ValueError("PointCloud2.point_step が不正です: %r" % (step,))
+
     buf = bytes(msg.data)
-    n = len(buf) // step
-    arr = np.frombuffer(buf, dtype=np.uint8).reshape(n, step)
-    out = np.empty((n, 3), np.float32)
+    width = int(getattr(msg, "width", 0) or 0)
+    height = int(getattr(msg, "height", 0) or 0)
+    if width <= 0 or height <= 0:
+        # 古い Unitree IDL / テストfixture向け。非organized cloudとして解釈する。
+        width = len(buf) // step
+        height = 1
+    if width == 0:
+        return np.empty((0, 3), dtype=np.float32)
+    row_step = int(getattr(msg, "row_step", 0) or width * step)
+    if row_step < width * step:
+        raise ValueError("PointCloud2.row_step が width*point_step より小さい")
+    needed = (height - 1) * row_step + width * step
+    if len(buf) < needed:
+        raise ValueError("PointCloud2.data が短い: %d < %d" % (len(buf), needed))
+
+    endian = ">" if bool(getattr(msg, "is_bigendian", False)) else "<"
+    out = np.empty((height * width, 3), np.float32)
     for k, name in enumerate(("x", "y", "z")):
-        o = offs[name]
-        out[:, k] = arr[:, o:o + 4].copy().view(np.float32)[:, 0]
-    ok = np.isfinite(out).all(axis=1)
-    return out[ok]
+        field = fields[name]
+        datatype = int(getattr(field, "datatype", 7))  # sensor_msgs/PointField.FLOAT32
+        if datatype == 7:
+            dtype = np.dtype(endian + "f4")
+        elif datatype == 8:
+            dtype = np.dtype(endian + "f8")
+        else:
+            raise ValueError("PointCloud2.%s は float field ではありません(datatype=%d)"
+                             % (name, datatype))
+        offset = int(field.offset)
+        if offset < 0 or offset + dtype.itemsize > step:
+            raise ValueError("PointCloud2.%s offset が point_step 外です" % name)
+        values = np.ndarray(
+            shape=(height, width), dtype=dtype, buffer=buf, offset=offset,
+            strides=(row_step, step))
+        out[:, k] = values.reshape(-1).astype(np.float32, copy=False)
+
+    return out[np.isfinite(out).all(axis=1)]
 
 
 def quat_to_yaw(w, x, y, z):

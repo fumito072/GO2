@@ -18,8 +18,10 @@ TOPIC_LOWCMD = "rt/lowcmd"
 TOPIC_SPORTSTATE = "rt/sportmodestate"
 # M0確認済み(2026-07-09, Go2 X実機): cloud_deskewed は frame_id=odom(world系)で配信。
 # 生の rt/utlidar/cloud は frame_id=utlidar_lidar(センサ系)なので使わない。
-TOPIC_LIDAR_CLOUD = "rt/utlidar/cloud_deskewed"  # L1点群 odom系 (--cloud-frame world でOK)
-TOPIC_LIDAR_ODOM = "rt/utlidar/robot_odom"       # LiDARオドメトリ (M0確認済み: 受信OK, frame_id=odom)
+TOPIC_LIDAR_CLOUD = os.environ.get(
+    "GO2_LIDAR_CLOUD_TOPIC", "rt/utlidar/cloud_deskewed")  # L1点群 odom系
+TOPIC_LIDAR_ODOM = os.environ.get(
+    "GO2_LIDAR_ODOM_TOPIC", "rt/utlidar/robot_odom")       # LiDARオドメトリ
 
 # ---------- プロセス間通信（このバンドル内） ----------
 # elevation_node → rl_stair_controller: height_scan 187点 (float32×187, リトルエンディアン)
