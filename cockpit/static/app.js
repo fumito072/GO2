@@ -754,9 +754,19 @@ drawCamHud();
 
 // ---------------- ハイトマップ ----------------
 function onHeightmap(buf) {
+  if (!(buf instanceof ArrayBuffer) || buf.byteLength < 15) {
+    console.warn("ハイトマップframeが短すぎるため破棄しました", buf && buf.byteLength);
+    return;
+  }
   const v = new DataView(buf);
   const cx = v.getFloat32(1, true), cy = v.getFloat32(5, true);
   const res = v.getFloat32(9, true), n = v.getUint16(13, true);
+  const expectedBytes = 15 + n * n * 4;
+  if (!n || n > 512 || buf.byteLength !== expectedBytes) {
+    console.warn("ハイトマップframeのshapeとpayload長が不一致のため破棄しました",
+                 n, buf.byteLength, expectedBytes);
+    return;
+  }
   hmap = { cx, cy, res, n, data: new Float32Array(buf.slice(15, 15 + n * n * 4)) };
   drawHeightmap();
 }
