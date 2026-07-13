@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>GO2 COCKPIT</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="/static/icon.png">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header id="topbar">
+  <div class="brand">GO2 <span>COCKPIT</span></div>
+  <div class="status-group">
+    <div class="stat"><span class="dot" id="conn-dot"></span><span id="conn-text">接続中…</span></div>
+    <div class="stat" id="mode-badge">--</div>
+    <div class="stat">🔋 <span id="batt">--</span> V</div>
+    <div class="stat">low <span id="lowage">--</span> ms</div>
+    <div class="stat">LiDAR <span id="cloudhz">--</span> Hz</div>
+    <div class="stat">pose: <span id="posesrc">--</span></div>
+  </div>
+  <div class="topbar-actions">
+    <label class="arm-switch" title="ONにするまで移動コマンドは送信されません">
+      <input type="checkbox" id="arm-toggle">
+      <span class="arm-slider"></span>
+      <span class="arm-label" id="arm-label">DISARMED</span>
+    </label>
+    <button id="btn-stop" class="btn-stop" title="移動停止 (Space)">■ 停止</button>
+    <button id="btn-damp" class="btn-damp" title="全関節脱力 — 立っていると崩れます (緊急用)">⚡ DAMP</button>
+  </div>
+</header>
+
+<main id="grid">
+  <section class="panel" id="panel-cam">
+    <h2>前面カメラ <span class="sub" id="cam-age"></span></h2>
+    <div class="cam-wrap"><img id="cam" src="/video" alt="camera"></div>
+  </section>
+
+  <section class="panel" id="panel-lidar">
+    <h2>LiDAR 点群 (odom系) <span class="sub">ドラッグ=回転 / ホイール=ズーム</span></h2>
+    <div id="lidar3d"></div>
+  </section>
+
+  <section class="panel" id="panel-hmap">
+    <h2>ハイトマップ <span class="sub" id="hmap-info">8m四方 / 0.1m格子</span></h2>
+    <div class="hmap-wrap">
+      <canvas id="hmap" width="480" height="480"></canvas>
+      <canvas id="hmap-legend" width="46" height="480"></canvas>
+    </div>
+    <div id="stair-bar">
+      <span id="stair-detect">段差: --</span>
+      <label title="カメラ画像をVLMに見せて安全確認してから登る">
+        <input type="checkbox" id="stair-confirm" checked> カメラ確認
+      </label>
+      <label title="連続する階段を登り続ける">
+        <input type="checkbox" id="stair-multi" checked> 連続
+      </label>
+      <button id="btn-stair" title="純正歩容で 整列→接近→登坂 (≤16cm)">🪜 登る(純正)</button>
+      <button id="btn-stair-stop" title="登坂タスク中断">✕</button>
+    </div>
+    <div id="stair-status"></div>
+    <div id="rl-bar">
+      <span class="rl-title">🧠 学習方策(M3)</span>
+      <select id="rl-policy" title="使用する学習済み方策">
+        <option value="wave5">Wave5 (既定/外乱耐性)</option>
+        <option value="wave4">Wave4 (0.23m級)</option>
+      </select>
+      <label title="ON=方策は推論するがモータへ指令を送らない(安全な予行演習)">
+        <input type="checkbox" id="rl-dry" checked> dry-run
+      </label>
+      <button id="btn-rl-climb" title="段差手前まで純正で接近→sport解除→学習方策で登坂 (≤25cm)">🧠 登る(学習)</button>
+      <button id="btn-rl-stop" title="方策を安全停止(Damp)">✕</button>
+      <button id="btn-rl-restore" title="低レベル制御後、純正歩容へ復帰">Sport復帰</button>
+    </div>
+    <div id="rl-status"></div>
+  </section>
+
+  <section class="panel" id="panel-telem">
+    <h2>テレメトリ</h2>
+    <div class="telem-flex">
+      <canvas id="horizon" width="110" height="110" title="姿勢 (roll/pitch)"></canvas>
+      <div class="telem-list">
+        <div>RPY <b id="t-rpy">--</b></div>
+        <div>速度 <b id="t-vel">--</b> m/s</div>
+        <div>位置 <b id="t-pos">--</b> m</div>
+        <div>体高 <b id="t-bh">--</b> m</div>
+        <div>指令 <b id="t-cmd">--</b></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="panel" id="panel-joints">
+    <h2>関節 (SDK順) <span class="sub">q [rad] / dq [rad/s] / τ [Nm]</span></h2>
+    <table id="joints"><thead>
+      <tr><th>joint</th><th>q</th><th>dq</th><th>τ</th></tr>
+    </thead><tbody></tbody></table>
+  </section>
+
+  <section class="panel" id="panel-ctrl">
+    <h2>操縦 <span class="sub">W/S 前後 A/D 平行 Q/E 旋回 Space 停止</span></h2>
+    <div class="ctrl-body">
+      <div class="pad">
+        <button class="key" data-k="q">Q ⟲</button>
+        <button class="key" data-k="w">W ↑</button>
+        <button class="key" data-k="e">E ⟳</button>
+        <button class="key" data-k="a">A ←</button>
+        <button class="key stopkey" data-k="space">■</button>
+        <button class="key" data-k="d">D →</button>
+        <div></div>
+        <button class="key" data-k="s">S ↓</button>
+        <div></div>
+      </div>
+      <div class="ctrl-right">
+        <label>速度スケール <span id="scale-val">0.4</span>
+          <input type="range" id="scale" min="0.2" max="1.0" step="0.1" value="0.4">
+        </label>
+        <div class="pose-btns">
+          <button id="btn-standup">立ち上がる</button>
+          <button id="btn-standdown">伏せる</button>
+          <button id="btn-balance">バランス立位</button>
+        </div>
+        <div class="voice-row">
+          <button id="btn-mic" title="押している間だけ録音 → 離すと認識・実行">🎤 押して話す</button>
+          <span id="voice-text"></span>
+        </div>
+        <div class="mission-row">
+          <input id="mission-input" type="text"
+                 placeholder="AI任務: 例「前方に見える階段の前まで行って」(Enterで実行)">
+          <button id="btn-mission-go" title="ClaudeがカメラとLiDARを見ながら遂行します">▶ AI実行</button>
+          <button id="btn-mission-stop" title="ミッション中断">✕</button>
+        </div>
+        <div id="mission-status"></div>
+        <div id="log"></div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script src="/static/three.min.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>

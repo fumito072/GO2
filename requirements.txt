@@ -1,0 +1,12 @@
+# real_mac_GO2 — ロボット側PC(Ethernet直結)の依存
+# python 3.10+ 推奨。unitree_sdk2py は git から:
+#   pip install git+https://github.com/unitreerobotics/unitree_sdk2_python.git
+# (cyclonedds のビルドが必要な場合は同リポジトリREADME参照)
+numpy
+opencv-python
+torch            # CPUで可（policy.ptは1.1MBのMLP）。CUDAがあれば --device cuda
+# --- M1 音声/VLM ---
+sounddevice
+faster-whisper
+anthropic        # ANTHROPIC_API_KEY を設定（またはopenai互換: pip install openai）
+# --- M2 NaVILA(5090側) は別環境: m2_navila/INSTALL_NAVILA_JP.md 参照 ---
