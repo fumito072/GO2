@@ -4,6 +4,7 @@
 # (cyclonedds のビルドが必要な場合は同リポジトリREADME参照)
 numpy
 opencv-python
+aiohttp          # cockpit HTTP/WebSocket server
 torch            # CPUで可（policy.ptは1.1MBのMLP）。CUDAがあれば --device cuda
 # --- M1 音声/VLM ---
 sounddevice
