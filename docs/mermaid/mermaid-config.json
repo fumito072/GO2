@@ -1,0 +1,14 @@
+{
+  "theme": "neutral",
+  "securityLevel": "strict",
+  "fontFamily": "Hiragino Sans, Hiragino Kaku Gothic ProN, Yu Gothic, Noto Sans CJK JP, sans-serif",
+  "themeVariables": {
+    "fontSize": "16px"
+  },
+  "flowchart": {
+    "htmlLabels": true,
+    "curve": "basis",
+    "nodeSpacing": 42,
+    "rankSpacing": 58
+  }
+}

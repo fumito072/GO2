@@ -1,0 +1,43 @@
+flowchart TB
+    TXT[文字入力]
+    MIC[Operator microphone\nAirPods / wired headset]
+    VG[Mac 音声 Gateway\nPTT / device監視 / HTTPS]
+    ASR[Local ASR\nVAD + faster-whisper]
+    GP[Goal Parser\nschema constrained]
+    FSM[Mission Executive\nFSM / Behavior Tree]
+    SEM[Semantic Stair Finder\nmap ID / detector / optional VLA]
+    GEO[Stair Localizer\nLiDAR + RGB-D + temporal fusion]
+    NAV[Navigation\nSLAM / planner / staging pose]
+    SK[Stair Skill\nALIGN / ASCEND / DESCEND / HOLD]
+    ARB[Command Arbiter\nintent / state priority]
+    SAFE[Independent Safety Supervisor\nmonitor + latched request only]
+    GATE[Exclusive Actuation Gateway\none backend authority]
+    SPORTNAV[Common NAV executor\nformal Sport Move / StopMove]
+    SPORT[Branch S\nformal Sport stair API]
+    POLICY[Branch L\nlocomotion policy 50 Hz]
+    SERVO[Branch L\nsingle LowCmd publisher default 500 Hz]
+    ROBOT[GO2 X]
+    LOG[Recorder / Replay / Run Ledger]
+
+    TXT --> GP
+    MIC --> VG --> ASR --> GP
+    GP --> FSM
+    FSM --> SEM --> GEO
+    FSM --> NAV
+    FSM --> SK
+    NAV --> ARB
+    SK --> ARB
+    ARB --> GATE
+    GATE -->|NAVIGATING: common| SPORTNAV
+    GATE -->|S: exclusive| SPORT
+    GATE -->|L: exclusive| POLICY --> SERVO
+    SAFE --> ARB
+    SPORTNAV --> ROBOT
+    SPORT --> ROBOT
+    SERVO --> ROBOT
+    ROBOT --> GEO
+    ROBOT --> SAFE
+    ROBOT --> LOG
+    GP --> LOG
+    FSM --> LOG
+    SAFE --> LOG
