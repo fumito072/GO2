@@ -4,7 +4,8 @@
 schema_version: 1
 status: BLOCKED
 robot:
-  sku: BLOCKED            # Go2 X であることを serial・firmware とともに実機で確定(04 L45)
+  sku: Go2-X              # ユーザー申告(2026-07-15)。serial/firmware で実機確認は未実施
+  sku_source: USER_DECLARED
   serial: BLOCKED
   firmware_version: BLOCKED
   app_version: BLOCKED
