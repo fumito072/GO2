@@ -1,0 +1,35 @@
+stateDiagram-v2
+    [*] --> DISARMED
+    DISARMED --> IDLE: operator arm + self-check
+    IDLE --> NAVIGATING: NAVIGATE_TO_STAIR_APPROACH
+    NAVIGATING --> AT_BASE_HOLD: staging + alignment complete
+    NAVIGATING --> ACTIVE_HOLD: STOP_NOW / recoverable fault
+    AT_BASE_HOLD --> STAIR_BACKEND_PREFLIGHT: ASCEND + affordance OK
+    STAIR_BACKEND_PREFLIGHT --> ASCENDING: exclusive backend authority + ready
+    ASCENDING --> TOP_HOLD: top completion stable
+    ASCENDING --> ACTIVE_HOLD: phase-aware STOP_NOW / soft fault
+    TOP_HOLD --> DESCENT_PREFLIGHT: DESCEND + geometry OK
+    TOP_HOLD --> HOLD_TIMEOUT_RECOVERY: warn + max_top_hold_s expired + lock new goals
+    HOLD_TIMEOUT_RECOVERY --> DESCENT_PREFLIGHT: run-authorized fallback + fresh geometry + valid leases
+    HOLD_TIMEOUT_RECOVERY --> DISARMED: external capture confirmed
+    DESCENT_PREFLIGHT --> DESCENDING: exclusive backend authority + ready
+    DESCENDING --> BOTTOM_HOLD: bottom completion stable
+    BOTTOM_HOLD --> IDLE: backend-specific controlled exit
+    DESCENDING --> ACTIVE_HOLD: phase-aware STOP_NOW / soft fault
+    ACTIVE_HOLD --> NAVIGATING: manual RESUME, context=NAV
+    ACTIVE_HOLD --> STAIR_BACKEND_PREFLIGHT: new ASCEND, base preconditions OK
+    ACTIVE_HOLD --> DESCENT_PREFLIGHT: new DESCEND, top preconditions OK
+    ACTIVE_HOLD --> ASCENDING: manual RESUME, ascent phase revalidated
+    ACTIVE_HOLD --> DESCENDING: manual RESUME, descent phase revalidated
+    IDLE --> CRITICAL_STOP: critical fault
+    NAVIGATING --> CRITICAL_STOP: critical fault
+    AT_BASE_HOLD --> CRITICAL_STOP: critical fault
+    STAIR_BACKEND_PREFLIGHT --> CRITICAL_STOP: critical fault
+    ASCENDING --> CRITICAL_STOP: critical fault
+    TOP_HOLD --> CRITICAL_STOP: critical fault
+    HOLD_TIMEOUT_RECOVERY --> CRITICAL_STOP: recovery fault / recovery deadline expired
+    DESCENT_PREFLIGHT --> CRITICAL_STOP: critical fault
+    DESCENDING --> CRITICAL_STOP: critical fault
+    BOTTOM_HOLD --> CRITICAL_STOP: critical fault
+    ACTIVE_HOLD --> CRITICAL_STOP: critical fault
+    CRITICAL_STOP --> DISARMED: manual recovery only

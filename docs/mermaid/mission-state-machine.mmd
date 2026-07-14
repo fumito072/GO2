@@ -1,0 +1,35 @@
+flowchart LR
+    subgraph NOMINAL[Nominal mission path]
+        direction TB
+        START((Start)) --> DISARMED[DISARMED]
+        DISARMED -->|operator arm + self-check| IDLE[IDLE]
+        IDLE -->|NAVIGATE_TO_STAIR_APPROACH| NAV[NAVIGATING]
+        NAV -->|staging + alignment complete| BASE[AT_BASE_HOLD]
+        BASE -->|ASCEND + affordance OK| UP_PRE[STAIR_BACKEND_PREFLIGHT]
+        UP_PRE -->|exclusive authority + ready| UP[ASCENDING]
+        UP -->|top completion stable| TOP[TOP_HOLD]
+        TOP -->|DESCEND + geometry OK| DOWN_PRE[DESCENT_PREFLIGHT]
+        DOWN_PRE -->|exclusive authority + ready| DOWN[DESCENDING]
+        DOWN -->|bottom completion stable| BOTTOM[BOTTOM_HOLD]
+        BOTTOM -->|controlled exit| NEXT[IDLE / next mission]
+    end
+
+    subgraph EXCEPTIONS[Hold, timeout, and critical paths]
+        direction TB
+
+        STOP_EVENT["NAVIGATING / ASCENDING / DESCENDING<br/>STOP_NOW or recoverable fault"]
+        STOP_EVENT --> HOLD[ACTIVE_HOLD]
+        HOLD --> RECHECK["Manual resume only<br/>resume_context と状態別前提条件を再検証"]
+        RECHECK --> RETURN["Return target<br/>NAVIGATING / ascent or descent preflight"]
+
+        TOP_TIMEOUT["TOP_HOLD<br/>max_top_hold_s expired"]
+        TOP_TIMEOUT --> REC[HOLD_TIMEOUT_RECOVERY]
+        REC --> EXT[External capture confirmed → DISARMED]
+        REC --> FALLBACK["Run-authorized fallback<br/>fresh geometry + valid leases → DESCENT_PREFLIGHT"]
+
+        FAULT["Any armed mission state<br/>critical fault or recovery deadline failure"]
+        FAULT --> C_STOP[CRITICAL_STOP]
+        C_STOP --> MANUAL[Manual recovery only → DISARMED]
+    end
+
+    IDLE ~~~ STOP_EVENT

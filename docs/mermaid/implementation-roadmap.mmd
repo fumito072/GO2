@@ -1,0 +1,13 @@
+flowchart TD
+    A[Phase 0\n型番/API/階段/安全の成立性] --> B{純正階段歩容の\nformal API契約あり?}
+    B -->|Yes: 候補| C[Branch S候補\n純正歩容を skill 化]
+    B -->|No/SDK不可| D[Branch L\nLowCmd policy]
+    D --> E{Wave5 が exact stair で\n上り・下り合格?}
+    E -->|Yes| F[Wave5 を harden]
+    E -->|No| G[Isaac Lab で再学習]
+    C --> H[知覚・接近・音声・Mission 統合]
+    F --> H
+    G --> H
+    H --> I[段階的実機試験]
+    I --> J[既知環境 MVP]
+    J --> K[未知環境/VLA 拡張]
