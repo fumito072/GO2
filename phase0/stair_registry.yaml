@@ -1,0 +1,27 @@
+# Phase 0 成果物: stair registry(04_ROADMAP.md L62、項目定義は 05_ASCENT_DESCENT_DESIGN.md §1)
+# 状態: BLOCKED — 試験階段の実測が必要。推測値・カタログ値で埋めない。
+schema_version: 1
+status: BLOCKED
+stairs:
+  - stair_id: BLOCKED               # 例: stair_block4_lab01
+    location: BLOCKED
+    step_count: 4                   # 仕様固定値(docs/README.md: 0.10 m ± 0.01 m × 4 段)
+    riser_height_m:                 # 各段・左右端で実測(±0.01 m 検証)
+      step1: {left: BLOCKED, right: BLOCKED}
+      step2: {left: BLOCKED, right: BLOCKED}
+      step3: {left: BLOCKED, right: BLOCKED}
+      step4: {left: BLOCKED, right: BLOCKED}
+    tread_depth_m_min: BLOCKED
+    width_m_min: BLOCKED
+    surface_material: BLOCKED
+    friction_condition: BLOCKED
+    edge_rounding: BLOCKED
+    fixation: BLOCKED               # ブロックの固定方法(ずれ対策)
+    top_landing:
+      size_m: BLOCKED               # 全4足+約1mの旋回面可否 → 下降方式決定(04 L53)
+      turn_radius_ok: BLOCKED       # false なら 180°旋回を仕様から外し後退下降(04 L70)
+    bottom_landing:
+      size_m: BLOCKED
+    photos: []                      # artifacts/stairs/<stair_id>/photos/ へ(09 §4)
+    measured_at: BLOCKED
+    measured_by: BLOCKED
