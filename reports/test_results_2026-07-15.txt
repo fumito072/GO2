@@ -1,0 +1,14 @@
+﻿python : .................................................................
+........................................................................
+At C:\Users\FUJIFILM\colapis\GO2\scripts\commit_session.ps1:7 char:1
++ python -m unittest discover -s tests 2>&1 | Out-File -Encoding utf8 r ..
+.
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (............................ 
+   .....:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+----------------------------------------------------------------------
+Ran 137 tests in 0.010s
+
+OK
