@@ -180,7 +180,7 @@ inventory ファイルに凍結記録済み。
 | `python -m cockpit.test_lidar_pipeline` | 12/12 PASS |
 | `python -m m3_rl.joint_map` | PASS(round-trip) |
 | `python -m cockpit.voice` | exit 0(assert なし=参考値。§4-7 のとおり受入試験としては無効) |
-| `python -m m3_rl.test_obs_builder` | **NOT RUN — torch 未導入**(Windows 側)。WSL2 go2-runtime 環境構築後に実行 |
+| `python -m m3_rl.test_obs_builder` | **ALL OK**(WSL2 go2-runtime venv: torch 2.13.0+cpu / numpy 2.4.4 / Python 3.12.3)。[1] joint mapping round-trip OK [2] policy 1step OK \|act\|max=1.919 [3] 100step feedback OK max\|Δq\|=0.838 rad [4] command sensitivity OK Δact=1.388。自己申告どおり「配線疎通であり物理の検証ではない」 |
 
 補足確認: cockpit.stair の「緩斜面」case は期待値 None のため h=0.058 の
 「stairs」分類でも PASS になる(§監査指摘の実在をログで確認)。
@@ -197,8 +197,11 @@ inventory ファイルに凍結記録済み。
 2. ~~Phase 1 最初の contract task~~ → **完了**: `contracts/`+`mission/command_arbiter.py`+
    `safety/stop_transitions.py`、offline test 137/137 PASS。multi-agent adversarial
    review 2巡(確定指摘 19 件反映、棄却 3 件)。
-3. **次**: WSL2 Ubuntu-24.04 に go2-runtime 分離環境を構築(python venv + torch CPU +
-   unitree_sdk2py。robot 接続はしない)→ `m3_rl.test_obs_builder` 実行で baseline 完了。
+3. ~~WSL2 go2-runtime 環境 + torch 系 baseline~~ → **完了**: `~/go2-runtime` venv
+   (Ubuntu-24.04 / Python 3.12.3 / torch 2.13.0+cpu / numpy 2.4.4、構築スクリプト
+   `scripts/wsl_setup_go2_runtime.sh`)。`test_obs_builder` ALL OK(§8.3)。
+   unitree_sdk2py + cyclonedds の導入は robot 接続方針の確認後(BLOCKED のまま)。
 4. **次**: Exclusive Actuation Gateway の offline 実装(受入条件は contracts/README.md)。
+   依存 lock(go2-runtime の pip freeze + hash)も次コミットで追加する。
 5. BLOCKED 継続: vendor 質問票の送付(phase0/api_gate_report.md)、physical E-stop 同定、
    階段実測(phase0/stair_registry.yaml)— いずれも実機・現場・ユーザー判断が必要。
