@@ -1,0 +1,38 @@
+Voice/NL pipeline + exploration skeleton + Exclusive Actuation Gateway
+
+Goal redefinition (voice control / natural-language control / autonomous
+exploration + mapping):
+
+- contracts v1.1: add EXPLORE_AND_MAP and NAVIGATE_TO_WAYPOINT intents,
+  EXPLORATION_COMPLETE / WAYPOINT_REACHED predicates, target types
+  area/waypoint, intent-target consistency checks. v1.0 payloads remain
+  accepted (SUPPORTED_SCHEMA_VERSIONS).
+- voice_gateway/intent_parser.py: deterministic Japanese grammar parser
+  per docs/06 sec 8.3: STOP_NOW only for standalone/immediate stop;
+  trailing stop is a completion condition; negation/quotes/questions/
+  prohibitions never execute; stop-suppressing requests rejected as
+  safety-weakening; compound ascend+descend needs clarification.
+  Added as a new path; legacy substring-stop parser left untouched.
+- docs/10_EXPLORATION_MAPPING.md: exploration/mapping architecture
+  (frontier baseline over GlobalOccupancyMap, Sport-mode only, offline
+  E0-E2 validation before any LIVE).
+- perception/global_map.py: 2D occupancy grid (UNKNOWN != FREE enforced,
+  ray casting, hazard projection, per-cell freshness, persistence).
+- navigation/frontier_explorer.py: deterministic frontier exploration
+  baseline (info-gain scoring, max-step clipping, NO_OBSERVATIONS /
+  NO_REACHABLE_FRONTIER distinguished from COMPLETE to prevent false
+  completion).
+- realtime/exclusive_actuation_gateway.py: single actuator authority
+  switch point. NAV/STAIR exclusivity (invariant 3), stair backend fixed
+  by signed run manifest (invariant 6), 4-step mode transition handshake
+  with runtime generations + append-only transition stream (docs/09
+  sec 5), policy_hash x manifest gate (docs/08 sec 4.3: mismatch never
+  reaches motor), lease-gated latch release, malformed-STOP_NOW
+  escalation, stop-sequence progression via the stop transition table
+  (guard-not-met = hold current state, not an exception).
+- tests/: docs/06 sec 12.2 full regression set for the parser; synthetic
+  room tests (enclosed room completes, door opening yields goal) for
+  map + explorer; gateway acceptance tests (a)(b)(c) from
+  contracts/README.md.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>

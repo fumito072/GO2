@@ -1,7 +1,20 @@
 # Phase 0 成果物: API gate report / vendor 質問票(04_ROADMAP.md L63)
 
-状態: **BLOCKED** — Unitree / 販売店への正式確認と実機実測が必要。
-本ファイルは質問票と記録テンプレート。回答を得るまで、該当 branch の判断を変更しない。
+状態: **SKIPPED(ユーザー決定 2026-07-15)+ 一部 USER_DECLARED**
+
+- ユーザー決定: vendor への質問送付は行わない。SKU は **Go2 X**(申告)。
+- 帰結(記録):
+  - **Branch S(純正階段歩容の formal API)は候補から除外**(Gate 1S の成立条件を
+    満たす手段がないため)。階段昇降を行う場合は Branch L(LowCmd)一本になる。
+  - LowCmd 可否・保証条件・firmware timeout・remote override の意味は vendor 確認
+    なしのため **実測でしか確認できない**。該当項目は「吊り下げ/非接地の実測 Gate
+    (2L)」へ先送りし、それまで当該能力は ASSUMED のまま実機判断に使わない。
+  - physical E-stop の同定(08 §2.5)は**スキップ対象外**。これが未同定の間、
+    階段 LIVE は NO-GO のまま(平地 LIVE も Gate 3 の停止試験が前提)。
+- プロジェクト目標の再定義(ユーザー指示): ①音声操作 ②自然言語操作
+  ③自律探索+マップ構築。階段 Mission は優先度低下(後回し)。
+
+以下の質問票は将来 vendor 確認を行う場合のために保存する。
 
 ## 1. Unitree / 販売店への質問票(未送付)
 

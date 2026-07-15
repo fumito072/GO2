@@ -45,10 +45,16 @@ class Modality(Enum):
 
 @unique
 class Intent(Enum):
+    """v1.0 = docs/02 §4.1 の4種(階段 MVP)。
+    v1.1 = 目標再定義(2026-07-15: 音声/自然言語操作+自律探索)による追加2種。
+    未知 intent は UNSUPPORTED として拒否する(docs/03)。"""
     NAVIGATE_TO_STAIR_APPROACH = "NAVIGATE_TO_STAIR_APPROACH"
     ASCEND_STAIRS = "ASCEND_STAIRS"
     DESCEND_STAIRS = "DESCEND_STAIRS"
     STOP_NOW = "STOP_NOW"
+    # --- v1.1(探索/移動。実行は既知地図 nav / 探索 planner の実装後) ---
+    EXPLORE_AND_MAP = "EXPLORE_AND_MAP"              # 自律探索してマップ構築
+    NAVIGATE_TO_WAYPOINT = "NAVIGATE_TO_WAYPOINT"    # 記名地点(home 等)へ移動
 
 
 @unique
@@ -57,6 +63,9 @@ class CompletionPredicate(Enum):
     TOP_LANDING_STABLE = "TOP_LANDING_STABLE"
     BOTTOM_LANDING_STABLE = "BOTTOM_LANDING_STABLE"
     IMMEDIATE = "IMMEDIATE"
+    # --- v1.1 ---
+    EXPLORATION_COMPLETE = "EXPLORATION_COMPLETE"    # coverage/frontier 枯渇(server-side 基準)
+    WAYPOINT_REACHED = "WAYPOINT_REACHED"
 
 
 @unique
@@ -77,20 +86,38 @@ class Precondition(Enum):
     SAFETY_SUPERVISOR_OK = "SAFETY_SUPERVISOR_OK"
 
 
-# intent → completion.predicate の正準対応(docs/02 §4.2 の表)
+# intent → completion.predicate の正準対応(docs/02 §4.2 の表 + v1.1 追加)
 INTENT_TO_PREDICATE = {
     Intent.NAVIGATE_TO_STAIR_APPROACH: CompletionPredicate.STAIR_APPROACH_POSE_REACHED,
     Intent.ASCEND_STAIRS: CompletionPredicate.TOP_LANDING_STABLE,
     Intent.DESCEND_STAIRS: CompletionPredicate.BOTTOM_LANDING_STABLE,
     Intent.STOP_NOW: CompletionPredicate.IMMEDIATE,
+    Intent.EXPLORE_AND_MAP: CompletionPredicate.EXPLORATION_COMPLETE,
+    Intent.NAVIGATE_TO_WAYPOINT: CompletionPredicate.WAYPOINT_REACHED,
 }
+
+# intent → 許容 target.type(v1.1 で "stairs" 以外を導入)
+INTENT_TO_TARGET_TYPE = {
+    Intent.NAVIGATE_TO_STAIR_APPROACH: "stairs",
+    Intent.ASCEND_STAIRS: "stairs",
+    Intent.DESCEND_STAIRS: "stairs",
+    Intent.EXPLORE_AND_MAP: "area",          # ref: "current_room" | "all_reachable" | area token
+    Intent.NAVIGATE_TO_WAYPOINT: "waypoint",  # ref: "home" | 記名 waypoint token
+}
+
+# 自律移動を伴う intent は明示確認必須(復唱 readback — docs/02 §4.1、CLAUDE.md Phase 3)
+CONFIRMATION_REQUIRED_INTENTS = (
+    Intent.ASCEND_STAIRS, Intent.DESCEND_STAIRS,
+    Intent.EXPLORE_AND_MAP,   # 継続的な自律動作のため確認必須
+)
 
 # デモ仕様の速度上限(docs/02 §4.1 constraints)。緩和には根拠・review・test が必要
 # (docs/CLAUDE.md §10)。
 PROJECT_MAX_SPEED_MPS = 0.25
 # GoalSpec の受理期限上限。GoalProposal の確認 TTL 初期値 30 秒(docs/02 §4.1)を超えない。
 MAX_EXPIRES_AFTER_MS = 30_000
-SCHEMA_VERSION = "1.0"
+SCHEMA_VERSION = "1.1"
+SUPPORTED_SCHEMA_VERSIONS = ("1.0", "1.1")
 
 _SOURCE_KEYS = ("modality", "operator_lease_id", "session_id", "utterance_id")
 _TRANSCRIPT_KEYS = ("text", "language", "model_id", "evidence")
@@ -204,17 +231,27 @@ class Transcript:
         return out
 
 
+# v1.1 の許容 target type("stairs" は v1.0 から)
+_TARGET_TYPES = ("stairs", "area", "waypoint")
+# type ごとの記名 ref(それ以外は token として検証)
+_NAMED_REFS = {
+    "stairs": ("current", "nearest"),
+    "area": ("current_room", "all_reachable"),
+    "waypoint": ("home",),
+}
+
+
 @dataclass(frozen=True)
 class Target:
-    type: str                      # 現仕様は "stairs" のみ
-    ref: str                       # "current" | "nearest" | stair_id token
-    resolved_id: Optional[str]     # 解決済み stair_id or None
+    type: str                      # "stairs" | "area" | "waypoint"
+    ref: str                       # 記名 ref または ID token
+    resolved_id: Optional[str]     # 解決済み instance ID or None
 
     def validate(self, path: str = "target") -> None:
-        if self.type != "stairs":
-            fail(path + ".type", "現仕様は 'stairs' のみ: %r" % (self.type,))
-        if self.ref not in ("current", "nearest"):
-            V.req_token(self.ref, path + ".ref")  # stair_id 直接参照
+        if self.type not in _TARGET_TYPES:
+            fail(path + ".type", "許容 type は %s: %r" % (_TARGET_TYPES, self.type))
+        if self.ref not in _NAMED_REFS[self.type]:
+            V.req_token(self.ref, path + ".ref")  # instance ID 直接参照
         if self.resolved_id is not None:
             V.req_token(self.resolved_id, path + ".resolved_id")
 
@@ -386,9 +423,9 @@ class GoalSpec:
         self.validate()
 
     def validate(self) -> None:
-        if self.schema_version != SCHEMA_VERSION:
+        if self.schema_version not in SUPPORTED_SCHEMA_VERSIONS:
             fail("schema_version", "未対応 version: %r(対応: %s)"
-                 % (self.schema_version, SCHEMA_VERSION))
+                 % (self.schema_version, SUPPORTED_SCHEMA_VERSIONS))
         V.req_uuid(self.goal_id, "goal_id")
         V.req_enum_member(self.intent, Intent, "intent")
         for name, want in (("source", Source), ("transcript", Transcript),
@@ -441,10 +478,16 @@ class GoalSpec:
             if self.target is None:
                 fail("target", "%s は target 必須" % self.intent.name)
             self.target.validate()
-            if self.intent in (Intent.ASCEND_STAIRS, Intent.DESCEND_STAIRS):
-                # 昇降は明示確認必須(docs/02 §4.1、CLAUDE.md Phase 3)
+            # intent と target.type の整合(v1.1)
+            want_type = INTENT_TO_TARGET_TYPE[self.intent]
+            if self.target.type != want_type:
+                fail("target.type", "%s の target.type は %r のみ: %r"
+                     % (self.intent.name, want_type, self.target.type))
+            if self.intent in CONFIRMATION_REQUIRED_INTENTS:
+                # 昇降・自律探索は明示確認必須(docs/02 §4.1、CLAUDE.md Phase 3)
                 if not self.confirmation.required:
                     fail("confirmation.required", "%s は明示確認必須" % self.intent.name)
+            if self.intent in (Intent.ASCEND_STAIRS, Intent.DESCEND_STAIRS):
                 if not self.constraints.require_geometry_confirmation:
                     fail("constraints.require_geometry_confirmation",
                          "%s は幾何再検証必須(invariant 10)" % self.intent.name)
@@ -452,6 +495,13 @@ class GoalSpec:
                 if missing:
                     fail("preconditions", "%s は4前提すべて必須。欠落: %s"
                          % (self.intent.name, missing))
+            elif self.intent is Intent.EXPLORE_AND_MAP:
+                # 探索は階段幾何を要求しないが、lease/ARM/supervisor は必須
+                need = (Precondition.OPERATOR_LEASE_VALID, Precondition.ROBOT_ARMED,
+                        Precondition.SAFETY_SUPERVISOR_OK)
+                missing = [p.name for p in need if p not in seen]
+                if missing:
+                    fail("preconditions", "EXPLORE_AND_MAP の必須前提の欠落: %s" % missing)
 
     @classmethod
     def from_dict(cls, d: Mapping) -> "GoalSpec":
@@ -546,7 +596,7 @@ class GoalProposal:
         self.validate()
 
     def validate(self) -> None:
-        if self.schema_version != SCHEMA_VERSION:
+        if self.schema_version not in SUPPORTED_SCHEMA_VERSIONS:
             fail("schema_version", "未対応 version: %r" % (self.schema_version,))
         V.req_uuid(self.proposal_id, "proposal_id")
         V.req_uuid(self.challenge_id, "challenge_id")
@@ -566,6 +616,10 @@ class GoalProposal:
         if self.target is None:
             fail("target", "%s は target 必須" % self.intent.name)
         self.target.validate()
+        want_type = INTENT_TO_TARGET_TYPE[self.intent]
+        if self.target.type != want_type:
+            fail("target.type", "%s の target.type は %r のみ: %r"
+                 % (self.intent.name, want_type, self.target.type))
         self.completion.validate()
         want = INTENT_TO_PREDICATE[self.intent]
         if self.completion.predicate is not want:
