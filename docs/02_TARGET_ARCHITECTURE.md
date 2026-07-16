@@ -234,6 +234,8 @@ stateDiagram-v2
 
 ## 6. Navigation と階段候補
 
+LingBot-Map は現時点で採用済みの SLAM/localization provider ではない。camera-derived visual map 候補としての個別評価は [10_LINGBOT_MAP_INTEGRATION_ASSESSMENT.md](10_LINGBOT_MAP_INTEGRATION_ASSESSMENT.md) を参照する。採用前に、本書の `map`/`odom` 責任分界、LiDAR guardian、command authority を変更しない。
+
 ### 6.1 MVP: 既知の試験区画
 
 最初は SLAM map に `stair_id`, base pose, top pose, forbidden zone を登録する。文字命令は semantic landmark を引き、planner が階段そのものではなく 0.5〜0.8 m 手前の staging pose を目標にする。最後の 0.35〜0.50 m は Stair Localizer と専用 align controller が低速で詰める。

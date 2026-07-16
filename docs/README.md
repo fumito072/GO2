@@ -45,9 +45,10 @@
 | [07_SIM_TRAINING_SIM2REAL.md](07_SIM_TRAINING_SIM2REAL.md) | RTX 5090、Isaac Lab、MuJoCo、domain randomization、実機移行 |
 | [08_SAFETY_TEST_EVALUATION.md](08_SAFETY_TEST_EVALUATION.md) | hazard、試験ラダー、KPI、受入条件 |
 | [09_DATA_AND_OPERATIONS.md](09_DATA_AND_OPERATIONS.md) | センサ記録、replay、モデル台帳、依存固定、運用 |
+| [10_LINGBOT_MAP_INTEGRATION_ASSESSMENT.md](10_LINGBOT_MAP_INTEGRATION_ASSESSMENT.md) | LingBot-Map の統合可否、sidecar 構成、GPU・座標・安全評価 |
 | [mermaid/README.md](mermaid/README.md) | 設計図のSVG/PNGプレビューとMermaid編集元 |
 
-推奨の読み順は `01 → 02 → 04 → 05 → 08`。研究選択の根拠は `03`、音声と学習の実装詳細は `06` と `07` に分けた。
+推奨の読み順は `01 → 02 → 04 → 05 → 08`。研究選択の根拠は `03`、音声と学習の実装詳細は `06` と `07` に分けた。LingBot-Map を camera-derived visual map 候補として評価する場合は `10` を参照する。
 
 ## 現在地の要約
 

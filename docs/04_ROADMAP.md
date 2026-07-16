@@ -106,6 +106,7 @@ Go/No-Go:
 - `cloud_deskewed` と `robot_odom` 依存を明示し、失われた場合の Point-LIO/VIO fallback を評価する。
 - raw log から elevation map、StairModel、GoalSpec、completion detector を再生できる offline runner を作る。
 - firmware、git commit、model hash、calibration hash を run manifest に固定する。
+- LingBot-Map 等の camera-derived visual map は、この記録基盤で offline 評価してから採否を決める。個別 gate は [10_LINGBOT_MAP_INTEGRATION_ASSESSMENT.md](10_LINGBOT_MAP_INTEGRATION_ASSESSMENT.md) を参照し、Phase 2 の既定成果物には live 統合を含めない。
 
 成果物:
 
@@ -161,6 +162,7 @@ Go/No-Go:
 - 最終 0.35〜0.50 m の低速 align controller を実装する。
 - landing footprint ごとの freshness/coverage gate を作る。
 - planner failure、localization loss、stair候補消失、動的障害物でblind retryせず、停止/再計画/拒否するrecoveryを実装する。
+- SLAM/localization provider の候補として LingBot-Map を扱う場合も、最初は read-only shadow mode とし、単眼 scale、drift、reset、LiDAR alignment の gate を通るまで navigation/control source にしない。
 
 成果物:
 
