@@ -1,0 +1,22 @@
+Mission FSM (EXPLORING) + offline E2E: voice text to autonomous mapping
+
+- mission/executive.py: deterministic Mission FSM per docs/02 sec 5
+  (all canonical states + v1.1 EXPLORING) with built-in affordance
+  validation (docs/06 sec 8.4): parser/schema allowlist, operator lease
+  match, supervisor gate, dedup (utterance idempotency), state x intent
+  matrix, must_start_by deadline, STOP_NOW never via goal queue,
+  CRITICAL_STOP manual-recovery-only, resume context without auto-resume.
+- demo/synthetic_world.py: deterministic ray-cast world (two rooms
+  connected by a 1.0 m door).
+- demo/explore_e2e.py: full offline E2E over the production path
+  (utterance -> grammar parser -> GoalProposal -> confirmed GoalSpec ->
+  Mission FSM -> frontier explorer -> CommandEnvelope -> arbiter ->
+  gateway -> kinematic sim -> occupancy map). Demo result: exploration
+  completes in 83 steps, robot crosses the door, both rooms mapped,
+  terminal ACTIVE_HOLD. Mid-run STOP_NOW halts with no auto-resume.
+- tests/test_mission_executive.py, tests/test_e2e_explore.py.
+  Suite total 221/221 PASS.
+
+Robot-disconnected, deterministic (injected clock/uuid counter).
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>

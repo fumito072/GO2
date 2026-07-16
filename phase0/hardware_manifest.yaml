@@ -1,0 +1,34 @@
+# Phase 0 成果物: hardware manifest(04_ROADMAP.md L61)
+# 状態: BLOCKED — 実機情報が必要。実機接続・実測はユーザー承認後のみ。
+# 記入規則: 未確認の値を推測で埋めない。確認できない項目は BLOCKED のまま残す。
+schema_version: 1
+status: BLOCKED
+robot:
+  sku: Go2-X              # ユーザー申告(2026-07-15)。serial/firmware で実機確認は未実施
+  sku_source: USER_DECLARED
+  serial: BLOCKED
+  firmware_version: BLOCKED
+  app_version: BLOCKED
+  remote_controller_model: BLOCKED
+sensors:
+  lidar_model: BLOCKED    # 例: Unitree L1。topic/frame は api_gate_report 側で実測
+  front_camera: BLOCKED
+  foot_force_sensors: BLOCKED   # 搭載有無と Low-level mode 中の意味は vendor 確認(04 L51)
+compute:
+  onboard: BLOCKED
+  offboard_pc:            # RTX PC — platform readiness report(reports/)から転記する
+    os: PENDING_INVENTORY
+    gpu: PENDING_INVENTORY
+    cuda: PENDING_INVENTORY
+battery:
+  battery_ids: BLOCKED
+network:
+  robot_nic: BLOCKED      # Go2 専用 NIC 候補と通常 LAN/WAN の分離状況(CLAUDE.md §6.1)
+  dds_domain: BLOCKED
+safety_equipment:
+  physical_estop:
+    identified: false     # 未同定の間、階段 LIVE は NO-GO(08 §2.5)
+    device: BLOCKED
+    independence_verified: false
+  fall_restraint: BLOCKED
+  mats_barriers: BLOCKED
