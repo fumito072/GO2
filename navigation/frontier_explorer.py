@@ -1,6 +1,9 @@
 """navigation.frontier_explorer — frontier ベース探索の決定的 baseline(docs/10 §5)。
 
-純ロジック・決定的(同じ地図+同じ pose → 同じ goal)。時刻や乱数を使わない。
+純ロジック。既定は決定的(同じ地図+同じ pose → 同じ goal)で時刻や乱数を
+使わない。呼び出し側が seed 済み rng を注入した場合のみ、cluster 試行順を
+score 重み付きで確率化する(局所偏重の回避 — 操作者要望 2026-07-18。
+同じ seed なら再現可能なので、テスト容易性は維持される)。
 explorer は「次に観測すべき goal pose」を提案するだけで、
 実行可否は Mission FSM / arbiter / gateway が決める(invariant 1, 2)。
 
@@ -86,10 +89,34 @@ def find_frontier_clusters(gmap: GlobalOccupancyMap,
 def next_goal(gmap: GlobalOccupancyMap, robot_xy,
               min_cluster_cells: int = 5,
               max_step_m: float = 3.0,
-              inflate_cells: int = 3) -> ExplorationDecision:
-    """次の観測 goal を決定的に選ぶ。
+              inflate_cells: int = 3,
+              optimistic: bool = False,
+              min_goal_dist_m: float = 0.0,
+              avoid_xy=(),
+              avoid_radius_m: float = 0.5,
+              rng=None) -> ExplorationDecision:
+    """次の観測 goal を選ぶ。rng=None(既定)なら完全に決定的。
 
     score = cluster サイズ / (1 + 距離)。tie は cell 座標順で決定的に解く。
+
+    rng(random.Random)を渡すと、cluster の試行順を score 重み付きで
+    シャッフルする(Efraimidis–Spirakis)。score が高い cluster ほど先に
+    試されやすいが常に同じ順ではない — 毎回同じ frontier に向かう局所
+    偏重を避ける(操作者要望 2026-07-18)。同じ seed なら再現可能。
+
+    optimistic=True(探索計画専用): goal への踏み出し判定(_clip_along_ray)を
+    非OCCUPIED 通行可で行う — 未踏(UNKNOWN)域を通って frontier へ向かえる
+    (操作者要望 2026-07-17)。frontier の定義自体は従来どおり
+    「観測済み FREE と UNKNOWN の境界」のまま(UNKNOWN 全体を frontier に
+    しないため)。
+
+    min_goal_dist_m: goal がこれより近い場合、frontier 境界の先(cluster
+    centroid 方向)へ押し出す。床観測が疎な実機では robot 自身が frontier 上に
+    立つことがあり、押し出しがないと「即到達→同じ goal 再選択」で動けなくなる。
+
+    avoid_xy: 最近閉塞などで断念した goal 座標のリスト。半径 avoid_radius_m
+    以内の goal を出す cluster はスキップする(同じ袋小路の再選択防止)。
+    呼び出し側が渡す限り決定性は保たれる。
     """
     if not isinstance(gmap, GlobalOccupancyMap):
         raise ContractViolation("gmap", "GlobalOccupancyMap が必要")
@@ -103,6 +130,9 @@ def next_goal(gmap: GlobalOccupancyMap, robot_xy,
         raise ContractViolation("robot_xy", "地図範囲外: %r" % (robot_xy,))
 
     traversable = gmap.traversable_mask(inflate_cells=inflate_cells)
+    walkable = (gmap.traversable_mask(inflate_cells=inflate_cells,
+                                      optimistic=True)
+                if optimistic else traversable)
     clusters = [c for c in find_frontier_clusters(gmap, traversable)
                 if len(c) >= min_cluster_cells]
     if not clusters:
@@ -120,6 +150,13 @@ def next_goal(gmap: GlobalOccupancyMap, robot_xy,
         score = len(c) / (1.0 + dist)
         scored.append((-score, centroid[1], centroid[0], c, centroid, dist))
     scored.sort(key=lambda s: (s[0], s[1], s[2]))
+    if rng is not None and len(scored) > 1:
+        # score 重み付きシャッフル: key = u^(1/score) の降順(E–S 法)。
+        # 期待順位は score 順に近いが、低 score cluster も時々先頭に来る
+        scored = sorted(
+            scored,
+            key=lambda s: rng.random() ** (1.0 / max(-s[0], 1e-9)),
+            reverse=True)
 
     for _, _, _, cluster, centroid, _ in scored:
         # goal 候補 = cluster 内で robot に最も近い cell(FREE by construction)
@@ -128,9 +165,11 @@ def next_goal(gmap: GlobalOccupancyMap, robot_xy,
                        gmap.cell_to_world(p[0], p[1]), (rx, ry)))), p[1], p[0]))
         gx, gy = gmap.cell_to_world(best[0], best[1])
         d = math.hypot(gx - rx, gy - ry)
+        cwx, cwy = gmap.cell_to_world(int(round(centroid[0])),
+                                      int(round(centroid[1])))
         if d > max_step_m:
             # robot→goal の直線上、max_step 以内で最遠の通行可能 cell に clip
-            clipped = _clip_along_ray(gmap, traversable, (rx, ry), (gx, gy),
+            clipped = _clip_along_ray(gmap, walkable, (rx, ry), (gx, gy),
                                       max_step_m)
             if clipped is None:
                 continue  # この cluster へは今回踏み出せない → 次の cluster
@@ -138,8 +177,26 @@ def next_goal(gmap: GlobalOccupancyMap, robot_xy,
             d = math.hypot(gx - rx, gy - ry)
             if d <= 1e-6:
                 continue
-        cwx, cwy = gmap.cell_to_world(int(round(centroid[0])),
-                                      int(round(centroid[1])))
+        if d < min_goal_dist_m:
+            # robot が frontier 上/直近に立っている(床観測が疎な実機で頻発)。
+            # centroid 方向へ境界の先(未知側)まで押し出し、通行可能域で clip
+            ux, uy = cwx - rx, cwy - ry
+            n = math.hypot(ux, uy)
+            if n <= 1e-6:
+                continue
+            pushed = _clip_along_ray(
+                gmap, walkable, (rx, ry),
+                (rx + ux / n * max_step_m, ry + uy / n * max_step_m),
+                max_step_m)
+            if pushed is None:
+                continue
+            gx, gy = pushed
+            d = math.hypot(gx - rx, gy - ry)
+            if d < min_goal_dist_m:
+                continue  # 押し出しても近すぎる(すぐ塞がる方向) → 次の cluster
+        if any(math.hypot(gx - float(ax), gy - float(ay)) < avoid_radius_m
+               for ax, ay in avoid_xy):
+            continue  # 最近断念した goal の近傍 → 次の cluster
         yaw = math.atan2(cwy - gy, cwx - gx)
         return ExplorationDecision(
             ExplorationStatus.GOAL,

@@ -41,7 +41,9 @@
 </header>
 
 <main id="grid">
-  <div class="grid-row sensors-row">
+  <!-- メイン: 左=センサー2×2(カメラ/LiDAR/ハイトマップ/部屋マップ) 右=操作列 -->
+  <div class="main-row">
+    <div class="left-quad">
     <section class="panel sensor-panel" id="panel-cam">
       <h2><span>FRONT CAMERA</span><span class="sub"><span id="cam-age"></span> / FWD / HUD</span></h2>
       <div class="cam-wrap" id="cam-wrap">
@@ -80,36 +82,32 @@
         <div class="hazard-metric"><span>HAZARD</span><b id="stair-hazard" aria-live="polite">SCANNING</b></div>
       </div>
     </section>
-  </div>
 
-  <div class="grid-row operations-row">
-    <section class="panel" id="panel-telem">
-      <h2><span>ATTITUDE / TELEMETRY</span><span class="sub">10 Hz</span></h2>
-      <div class="telem-flex">
-        <div class="horizon-shell">
-          <canvas id="horizon" width="160" height="160" title="姿勢 (roll/pitch)"></canvas>
-          <span class="horizon-north">N</span>
+    <section class="panel" id="panel-expmap">
+      <h2><span>EXPLORE MAP</span><span class="sub expmap-key"><i class="sw sw-free"></i>通行可 <i class="sw sw-occ"></i>障害/危険 <i class="sw sw-unknown"></i>未観測</span></h2>
+      <div class="expmap-layout">
+        <canvas id="expmap" width="480" height="360" title="占有格子: 暗=未観測 / 明=通行可 / 赤=障害・危険"></canvas>
+        <div class="explore-actions">
+          <button type="button" id="btn-explore-auto" class="needs-arm"
+                  title="ワンクリックで自律探索を提案(復唱を確認してから開始)">🤖 自律探索</button>
+          <button type="button" id="btn-estop"
+                  title="全自律系を中断して停止(ARM不問・常時受理・ソフトウェア停止)">⛔ 緊急停止</button>
         </div>
-        <div class="telem-list">
-          <div><span>ROLL / PITCH / YAW</span><b id="t-rpy">--</b></div>
-          <div><span>VELOCITY</span><b><span id="t-vel">--</span> m/s</b></div>
-          <div><span>POSITION</span><b><span id="t-pos">--</span> m</b></div>
-          <div><span>BODY HEIGHT</span><b><span id="t-bh">--</span> m</b></div>
-          <div><span>COMMAND</span><b id="t-cmd">--</b></div>
+        <div id="explore-proposal" class="hidden">
+          <div id="explore-readback" aria-live="polite"></div>
+          <button type="button" id="btn-explore-confirm" class="needs-arm">✓ 確認して開始</button>
+          <button type="button" id="btn-explore-cancel">✕ 取消</button>
         </div>
+        <div class="mission-command-row">
+          <input id="explore-input" type="text" placeholder="例「部屋を探索してマップを作って」「ホームに戻って」">
+          <button type="button" id="btn-explore-go" title="契約パーサで解釈 → 確認後に開始">解釈</button>
+        </div>
+        <div id="explore-status" aria-live="polite">EXPLORE IDLE</div>
       </div>
     </section>
+    </div><!-- /left-quad -->
 
-    <section class="panel" id="panel-joints">
-      <h2><span>JOINTS</span><span class="sub">q / dq / τ</span></h2>
-      <div class="table-scroll">
-        <table id="joints">
-          <thead><tr><th>JOINT</th><th>POS</th><th>VEL</th><th>τ</th></tr></thead>
-          <tbody></tbody>
-        </table>
-      </div>
-    </section>
-
+    <div class="right-col">
     <section class="panel" id="panel-ctrl">
       <h2><span>CONTROL</span><span class="sub">8-WAY + ROTATE</span></h2>
       <div class="ctrl-body">
@@ -143,6 +141,61 @@
             <button type="button" id="btn-balance">BALANCE</button>
           </div>
         </div>
+      </div>
+    </section>
+
+    <section class="panel" id="panel-mission">
+      <h2><span>AI MISSION</span><span class="sub">VLA + VOICE</span></h2>
+      <div class="mission-layout">
+        <div class="mission-emblem" aria-hidden="true"><b>M3</b><span>VLA READY</span></div>
+        <div class="mission-main">
+          <div class="mission-command-row">
+            <input id="mission-input" type="text" placeholder="任務を入力：例「前方の階段まで移動して登る」">
+            <button type="button" id="btn-mission-go" title="カメラとLiDARを見ながら遂行します">EXECUTE</button>
+            <button type="button" id="btn-mission-stop" title="ミッション中断">CANCEL</button>
+          </div>
+          <div class="voice-row">
+            <button type="button" id="btn-mic" title="押している間だけ録音 → 離すと認識・実行">● PUSH TO TALK</button>
+            <span id="voice-text"></span>
+          </div>
+          <div id="mission-status" aria-live="polite">MISSION IDLE</div>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel" id="panel-log">
+      <h2><span>EVENT LOG</span><span class="sub">LATEST FIRST / MAX 60</span></h2>
+      <div id="log" role="log" aria-live="polite"></div>
+    </section>
+    </div><!-- /right-col -->
+  </div><!-- /main-row -->
+
+  <!-- 補助パネル(下段へスクロール): 姿勢/関節/階段操作 -->
+  <div class="grid-row aux-row">
+    <section class="panel" id="panel-telem">
+      <h2><span>ATTITUDE / TELEMETRY</span><span class="sub">10 Hz</span></h2>
+      <div class="telem-flex">
+        <div class="horizon-shell">
+          <canvas id="horizon" width="160" height="160" title="姿勢 (roll/pitch)"></canvas>
+          <span class="horizon-north">N</span>
+        </div>
+        <div class="telem-list">
+          <div><span>ROLL / PITCH / YAW</span><b id="t-rpy">--</b></div>
+          <div><span>VELOCITY</span><b><span id="t-vel">--</span> m/s</b></div>
+          <div><span>POSITION</span><b><span id="t-pos">--</span> m</b></div>
+          <div><span>BODY HEIGHT</span><b><span id="t-bh">--</span> m</b></div>
+          <div><span>COMMAND</span><b id="t-cmd">--</b></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel" id="panel-joints">
+      <h2><span>JOINTS</span><span class="sub">q / dq / τ</span></h2>
+      <div class="table-scroll">
+        <table id="joints">
+          <thead><tr><th>JOINT</th><th>POS</th><th>VEL</th><th>τ</th></tr></thead>
+          <tbody></tbody>
+        </table>
       </div>
     </section>
 
@@ -181,33 +234,7 @@
       </div>
       <div id="rl-status" aria-live="polite"></div>
     </section>
-  </div>
-
-  <div class="grid-row command-row">
-    <section class="panel" id="panel-mission">
-      <h2><span>AI MISSION</span><span class="sub">CAMERA + LiDAR + VLA</span></h2>
-      <div class="mission-layout">
-        <div class="mission-emblem" aria-hidden="true"><b>M3</b><span>VLA READY</span></div>
-        <div class="mission-main">
-          <div class="mission-command-row">
-            <input id="mission-input" type="text" placeholder="任務を入力：例「前方の階段まで移動して登る」">
-            <button type="button" id="btn-mission-go" title="カメラとLiDARを見ながら遂行します">EXECUTE</button>
-            <button type="button" id="btn-mission-stop" title="ミッション中断">CANCEL</button>
-          </div>
-          <div class="voice-row">
-            <button type="button" id="btn-mic" title="押している間だけ録音 → 離すと認識・実行">● PUSH TO TALK</button>
-            <span id="voice-text"></span>
-          </div>
-          <div id="mission-status" aria-live="polite">MISSION IDLE</div>
-        </div>
-      </div>
-    </section>
-
-    <section class="panel" id="panel-log">
-      <h2><span>EVENT LOG</span><span class="sub">LATEST FIRST / MAX 60</span></h2>
-      <div id="log" role="log" aria-live="polite"></div>
-    </section>
-  </div>
+  </div><!-- /aux-row -->
 </main>
 
 <script src="/static/three.min.js"></script>
