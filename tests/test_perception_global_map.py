@@ -168,6 +168,74 @@ class TestSafetySemantics(unittest.TestCase):
                              now_ns=3_000 + i, hit_mask=[False])
         self.assertEqual(m.grid[c[1], c[0]], OCCUPIED)
 
+    def test_legacy_optimistic_query_is_explicit_only(self):
+        # 旧UI照会互換ではUNKNOWNを表示できるが、既定/LIVE pathは常にFREEのみ。
+        m = make_map()
+        m.integrate_scan((0.0, 0.0), [(2.0, 0.0)], now_ns=1_000)
+        opt = m.traversable_mask(inflate_cells=3, optimistic=True)
+        default = m.traversable_mask(inflate_cells=3)
+        behind = m.world_to_cell(3.0, 0.0)      # 壁の向こう(UNKNOWN)
+        wall = m.world_to_cell(2.0, 0.0)        # OCCUPIED
+        near_wall = m.world_to_cell(1.85, 0.0)  # inflate 圏内
+        self.assertTrue(opt[behind[1], behind[0]])
+        self.assertFalse(default[behind[1], behind[0]])
+        self.assertFalse(opt[wall[1], wall[0]])
+        self.assertFalse(opt[near_wall[1], near_wall[0]])
+
+
+class TestEvidenceDecay(unittest.TestCase):
+    """証拠カウンタ(2026-07-17): 動的障害物は減衰して消え、壁と hazard は残る。"""
+
+    def test_dynamic_obstacle_decays(self):
+        # 人の脚など: 一度 OCCUPIED になっても ray が繰り返し通過すれば
+        # FREE へ降格する(地図の自己修正 — 幻の壁で探索が詰まらない)
+        m = make_map()
+        m.integrate_scan((0.0, 0.0), [(1.0, 0.0)], now_ns=1_000)
+        c = m.world_to_cell(1.0, 0.0)
+        self.assertEqual(m.grid[c[1], c[0]], OCCUPIED)
+        for i in range(3):   # 同位置を3回 ray が通過(人は既にいない)
+            m.integrate_scan((0.0, 0.0), [(2.0, 0.0)], now_ns=2_000 + i)
+        self.assertEqual(m.grid[c[1], c[0]], FREE)
+
+    def test_single_pass_keeps_occupied(self):
+        # 保守則: 1回の通過だけでは消えない(ノイズ耐性)
+        m = make_map()
+        m.integrate_scan((0.0, 0.0), [(1.0, 0.0)], now_ns=1_000)
+        m.integrate_scan((0.0, 0.0), [(2.0, 0.0)], now_ns=2_000)
+        c = m.world_to_cell(1.0, 0.0)
+        self.assertEqual(m.grid[c[1], c[0]], OCCUPIED)
+
+    def test_wall_persists_with_rehits(self):
+        # 実在の壁: ヒットが通過より優勢(+2/-1)なので観測が続く限り維持
+        m = make_map()
+        c = m.world_to_cell(2.0, 0.0)
+        for i in range(10):
+            m.integrate_scan((0.0, 0.0), [(2.0, 0.0)], now_ns=1_000 + 2 * i)
+            m.integrate_free_rays((0.0, 0.0), [(2.0, 0.0)],
+                                  now_ns=1_001 + 2 * i)
+        self.assertEqual(m.grid[c[1], c[0]], OCCUPIED)
+
+    def test_hazard_never_decays(self):
+        # drop hazard は何度 ray が通過しても消えない(安全側で永続)
+        m = make_map()
+        m.mark_hazard([(1.0, 0.0)], now_ns=1_000)
+        for i in range(10):
+            m.integrate_free_rays((0.0, 0.0), [(2.0, 0.0)], now_ns=2_000 + i)
+        c = m.world_to_cell(1.0, 0.0)
+        self.assertEqual(m.grid[c[1], c[0]], OCCUPIED)
+
+    def test_clear_footprint_never_purges_hazard(self):
+        # footprintによる自己点除去でもdrop/段差hazardは解除しない。
+        m = make_map()
+        m.mark_hazard([(0.1, 0.1)], now_ns=1_000)         # 幻(自己点由来)
+        m.integrate_scan((0.0, 0.0), [(2.0, 0.0)], now_ns=2_000)  # 実在の壁
+        m.clear_footprint((0.0, 0.0), 0.30, now_ns=3_000)
+        near = m.world_to_cell(0.1, 0.1)
+        wall = m.world_to_cell(2.0, 0.0)
+        self.assertEqual(m.grid[near[1], near[0]], OCCUPIED)
+        self.assertTrue(m.hazard_mask[near[1], near[0]])
+        self.assertEqual(m.grid[wall[1], wall[0]], OCCUPIED)
+
 
 class TestPersistence(unittest.TestCase):
     def test_roundtrip(self):

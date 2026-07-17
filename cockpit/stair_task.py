@@ -93,6 +93,11 @@ class StairTask:
         """backend='sport': 純正歩容(<=0.16m) / 'rl': M3学習方策(<=0.25m)。"""
         if self._run:
             return "登坂タスク実行中です"
+        if self._th is not None and self._th.is_alive():
+            # 前回スレッドが終了処理中(VLM確認等でブロック中の可能性)。
+            # _run フラグを共有しているため、ここで再開始すると旧スレッドが
+            # 蘇生して二重駆動になる(レビュー指摘 2026-07-18)
+            return "前回の登坂タスクが終了処理中です(数十秒後に再試行してください)"
         if not self.bridge.armed:
             return "ARMしてください(DISARM中は開始できません)"
         if backend == "rl":

@@ -50,6 +50,8 @@ let pose = null;          // [x,y,z,yaw]
 let armed = false;
 let hmap = null;          // {cx, cy, res, n, data(Float32Array)}
 let stair = null;         // 段差検出結果
+let expmap = null;        // {ox, oy, res, w, h, cells(Uint8Array)} 占有格子
+let explore = null;       // 探索タスク snapshot(telemetry経由)
 
 function log(msg, cls) {
   const el = document.createElement("div");
@@ -89,6 +91,7 @@ function connect() {
       const kind = view.getUint8(0);
       if (kind === 1) onLidar(ev.data);
       else if (kind === 2) onHeightmap(ev.data);
+      else if (kind === 3) onExpmap(ev.data);
     }
   };
 }
@@ -101,6 +104,11 @@ function onAck(d) {
   if (d.what === "arm") {
     setArmedUI(d.armed);
     log(d.armed ? "ARMED — 操縦有効" : "DISARMED", d.armed ? "err" : "ok");
+  } else if (d.what && d.what.startsWith("explore")) {
+    const r = d.result || {};
+    if (typeof r === "string") { log(d.what + ": " + r, "ok"); return; }
+    log("🗺 " + (r.say || r.kind || "ok"),
+        ["error", "rejected", "busy"].includes(r.kind) ? "err" : "ok");
   } else {
     log(d.what + ": " + d.result, d.result === "ok" ? "ok" : "err");
   }
@@ -147,6 +155,7 @@ function onTelemetry(d) {
   stair = d.stair || null;
   renderStair(d.stair, d.stair_task);
   renderRl(d.rl);
+  renderExplore(d.explore);
 
   if (d.q && d.joint_names) {
     const tb = $("joints").tBodies[0];
@@ -855,6 +864,189 @@ $("hmap").addEventListener("mouseleave", () => {
   $("hmap-info").textContent = "8m四方 / 0.1m格子";
 });
 
+// ---------------- 探索マップ(占有格子) ----------------
+// frame: [u8=3][f32 ox][f32 oy][f32 res][u16 W][u16 H][u8 cell...] cell: 0=未観測 1=FREE 2=OCCUPIED
+const EXPMAP_HEAD = 17;
+
+function onExpmap(buf) {
+  if (!(buf instanceof ArrayBuffer) || buf.byteLength < EXPMAP_HEAD) return;
+  const v = new DataView(buf);
+  const ox = v.getFloat32(1, true), oy = v.getFloat32(5, true);
+  const res = v.getFloat32(9, true);
+  const w = v.getUint16(13, true), h = v.getUint16(15, true);
+  if (!w || !h || w > 1024 || h > 1024 ||
+      buf.byteLength !== EXPMAP_HEAD + w * h) {
+    console.warn("探索マップframeのshape不一致で破棄", w, h, buf.byteLength);
+    return;
+  }
+  expmap = { ox, oy, res, w, h,
+             cells: new Uint8Array(buf.slice(EXPMAP_HEAD)) };
+  drawExpmap();
+}
+
+// 未観測 / FREE / OCCUPIED (RGBA)
+const EXP_RGBA = [[7, 16, 25, 255], [36, 96, 117, 255], [214, 69, 65, 255]];
+let expOff = null;   // オフスクリーン canvas(1px=1cell)。縮小潰れ防止
+
+function drawExpmap() {
+  const cv = $("expmap");
+  if (!cv || !expmap) return;
+  // 表示サイズに内部解像度を合わせる(マップ最大化レイアウト対応)
+  const wpx = cv.clientWidth, hpx = cv.clientHeight;
+  if (wpx && hpx && (cv.width !== wpx || cv.height !== hpx)) {
+    cv.width = wpx; cv.height = hpx;
+  }
+  const ctx = cv.getContext("2d");
+  const { ox, oy, res, w, h, cells } = expmap;
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.fillStyle = "#071019";
+  ctx.fillRect(0, 0, cv.width, cv.height);
+  // 観測済み cell の外接範囲 + 余白だけを表示(20m四方全体だと細かすぎる)
+  let minx = w, maxx = -1, miny = h, maxy = -1;
+  for (let iy = 0; iy < h; iy++) {
+    for (let ix = 0; ix < w; ix++) {
+      if (cells[iy * w + ix] !== 0) {
+        if (ix < minx) minx = ix;
+        if (ix > maxx) maxx = ix;
+        if (iy < miny) miny = iy;
+        if (iy > maxy) maxy = iy;
+      }
+    }
+  }
+  if (maxx < 0) return;  // まだ観測なし
+  const pad = 6;
+  minx = Math.max(0, minx - pad); maxx = Math.min(w - 1, maxx + pad);
+  miny = Math.max(0, miny - pad); maxy = Math.min(h - 1, maxy + pad);
+  const vw = maxx - minx + 1, vh = maxy - miny + 1;
+  const span = Math.max(vw, vh);
+  // 長方形キャンバスでは短辺に合わせ、余白分は中央寄せ
+  const S = Math.min(cv.width, cv.height);
+  const cell = S / span;
+  const padX = (cv.width - S) / 2, padY = (cv.height - S) / 2;
+
+  // 1cell=1px の画像を作り、nearest-neighbor で拡大(セル潰れ・色の滲みを防ぐ)
+  if (!expOff) expOff = document.createElement("canvas");
+  if (expOff.width !== w || expOff.height !== h) {
+    expOff.width = w; expOff.height = h;
+  }
+  const octx = expOff.getContext("2d");
+  const img = octx.createImageData(w, h);
+  for (let i = 0; i < w * h; i++) {
+    const c = EXP_RGBA[cells[i]] || EXP_RGBA[2];
+    img.data[i * 4] = c[0]; img.data[i * 4 + 1] = c[1];
+    img.data[i * 4 + 2] = c[2]; img.data[i * 4 + 3] = c[3];
+  }
+  octx.putImageData(img, 0, 0);
+
+  // 画面: 上=+x(前方), 左=+y(ハイトマップと同じ向き)。
+  // 画像画素(ix,iy) → 画面(c1-cell*iy, c2-cell*ix) の軸入替+反転を行列で表現。
+  const c1 = (span - vh) / 2 * cell + cell * (maxy + 1) + padX;
+  const c2 = (span - vw) / 2 * cell + cell * (maxx + 1) + padY;
+  ctx.imageSmoothingEnabled = false;
+  ctx.setTransform(0, -cell, -cell, 0, c1, c2);
+  ctx.drawImage(expOff, 0, 0);
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  const toScr = (wx, wy) => [c1 - cell * ((wy - oy) / res),
+                             c2 - cell * ((wx - ox) / res)];
+  // 軌跡
+  if (explore && explore.trace && explore.trace.length > 1) {
+    ctx.strokeStyle = "#43efd066";
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    explore.trace.forEach(([tx, ty], k) => {
+      const [sx, sy] = toScr(tx, ty);
+      k === 0 ? ctx.moveTo(sx, sy) : ctx.lineTo(sx, sy);
+    });
+    ctx.stroke();
+  }
+  // 現在の goal
+  if (explore && explore.goal) {
+    const [gx, gy] = toScr(explore.goal[0], explore.goal[1]);
+    ctx.strokeStyle = "#f7c948";
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(gx, gy, 6, 0, Math.PI * 2); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(gx - 9, gy); ctx.lineTo(gx + 9, gy);
+    ctx.moveTo(gx, gy - 9); ctx.lineTo(gx, gy + 9); ctx.stroke();
+  }
+  drawExpmapPose(ctx, toScr);
+}
+
+function drawExpmapPose(ctx, toScr) {
+  if (!pose || !toScr) return;
+  const [sx, sy] = toScr(pose[0], pose[1]);
+  ctx.save();
+  ctx.translate(sx, sy);
+  ctx.rotate(-pose[3]);
+  ctx.fillStyle = "#43efd0";
+  ctx.beginPath();
+  ctx.moveTo(0, -8); ctx.lineTo(5, 6); ctx.lineTo(-5, 6);
+  ctx.closePath(); ctx.fill();
+  ctx.restore();
+}
+
+let exploreLoggedStatus = "";
+let exploreEvSeq = 0;   // 受信済みの探索イベント通番(意思決定ログの逐次表示)
+
+function renderExplore(e) {
+  explore = e || null;
+  const st = $("explore-status"), panel = $("explore-proposal");
+  if (!st) return;
+  if (e && e.events) {
+    for (const [seq, text] of e.events) {
+      if (seq > exploreEvSeq) { exploreEvSeq = seq; log(`🗺 ${text}`); }
+    }
+  }
+  if (!e || e.status === "idle") {
+    st.textContent = "EXPLORE IDLE";
+    st.className = "";
+    panel.classList.add("hidden");
+    return;
+  }
+  panel.classList.toggle("hidden", e.status !== "proposal");
+  if (e.status === "proposal") $("explore-readback").textContent = e.detail || "";
+  const tag = { proposal: "確認待ち", running: "探索中", done: "✔ 完了",
+                stalled: "△ 打ち切り", stopped: "■ 停止", aborted: "■ 中断",
+                refused: "✕ 拒否", error: "⚠ エラー" }[e.status] || e.status;
+  const cnt = e.counts
+    ? ` free=${e.counts.free} occ=${e.counts.occupied}` : "";
+  st.textContent = `[${tag}] ${e.detail || ""}` +
+    (e.status === "running" ? ` (${e.elapsed}s${cnt})` : "");
+  st.className = e.status === "running" ? "running" : "";
+  if (e.status !== exploreLoggedStatus) {
+    exploreLoggedStatus = e.status;
+    if (["done", "stalled", "stopped", "aborted", "refused", "error"]
+        .includes(e.status)) {
+      log(`🗺 探索: [${tag}] ${e.detail || ""}`,
+          e.status === "done" ? "ok" : "err");
+    }
+  }
+}
+
+function sendExploreText() {
+  const text = $("explore-input").value.trim();
+  if (!text) { log("探索指示を入力してください", "err"); return; }
+  send({ type: "explore", text });
+}
+$("btn-explore-go").onclick = sendExploreText;
+$("explore-input").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.isComposing) { e.preventDefault(); sendExploreText(); }
+});
+$("btn-explore-confirm").onclick = () => {
+  if (hintIfDisarmed()) return;
+  send({ type: "explore_confirm" });
+};
+$("btn-explore-cancel").onclick = () => send({ type: "explore_cancel" });
+// 🤖 自律モード: ワンクリックで探索提案(開始には復唱確認が必要=安全契約)
+$("btn-explore-auto").onclick = () => {
+  if (hintIfDisarmed()) return;
+  send({ type: "explore_auto" });
+};
+// ⛔ 緊急停止: stopAll = cmd 0 + action:stop(ARM不問・サーバ側で全自律系中断)
+$("btn-estop").onclick = () => {
+  stopAll();
+  log("⛔ 緊急停止(全系停止・ソフトウェア停止)", "err");
+};
+
 // ---------------- 操縦 ----------------
 const keys = { w: false, a: false, s: false, d: false, q: false, e: false };
 const keyboardKeys = new Set();
@@ -1045,6 +1237,11 @@ async function sendVoice() {
   const it = d.intent;
   log(`♪「${d.text}」→ ${it.say}`, it.action === "none" ? "err" : "ok");
   $("voice-text").textContent = `「${d.text}」→ ${it.say}`;
+  if (d.goal) {
+    // 契約パーサが処理済み(提案/確認/停止/取消)。提案はEXPLORE MAPパネルに出る。
+    if (it.action === "stop") stopAll();
+    return;
+  }
   if (it.action === "none" && d.text.length >= 6) {
     // 単純コマンドでない発話はAI任務の入力欄へ(実行はユーザーが▶で)
     $("mission-input").value = d.text;

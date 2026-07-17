@@ -28,7 +28,7 @@ import numpy as np
 
 from common import config
 from common.safety import deploy_log
-from contracts.goal_spec import Intent, Modality
+from contracts.goal_spec import ConfirmationStatus, GoalSpec, Intent, Modality
 from navigation.collision_guard import CollisionGuard
 from navigation.exploration_controller import (
     ControlStatus, ExplorationController, ExplorationControllerConfig,
@@ -38,6 +38,7 @@ from voice_gateway.intent_parser import ParseKind, ParserContext, parse_utteranc
 
 DEFAULT_MODEL = "claude-sonnet-5"
 VX_MAX = 0.3
+VX_MIN = -0.15   # 後退(「下がって」系)。後方はカメラに映らないため前進より保守的
 WZ_MAX = 0.6
 # VLM判断間のopen-loop距離を制限する。旧値8秒では0.3m/s時に2.4m進み、
 # 次の画像/LiDAR判断より先に衝突できた。探索は下の10Hz controllerを使う。
@@ -47,6 +48,9 @@ MISSION_TIMEOUT_S = 180.0
 VLM_TIMEOUT_S = 90.0  # sonnetは画像2枚Readで30〜60秒かかることがある
 AUTONOMY_SENSOR_MAX_AGE_S = 0.60
 AUTONOMY_SENSOR_ABORT_S = 2.0
+AUTONOMY_LOWSTATE_MAX_AGE_S = 0.50
+AUTONOMY_MAX_ROLL_RAD = 0.50
+AUTONOMY_MAX_PITCH_RAD = 0.70
 EXPLORATION_LOOP_S = 0.10
 
 
@@ -118,14 +122,21 @@ SYSTEM_PROMPT = """あなたは四足ロボット Unitree Go2 の遠隔操縦支
 2. 数値コンテキスト(前方障害物距離・観測率・現在速度)も踏まえる。
 3. 次の1手を JSON オブジェクト1個だけで出力する。コードブロック記法・説明文・前置きは禁止。
 
-出力形式: {"action":"move|turn|stop|done","vx":0.0〜0.3,"wz":-0.6〜0.6,"reason":"30字以内"}
+出力形式: {"action":"move|turn|stop|done","vx":-0.15〜0.3,"wz":-0.6〜0.6,"reason":"30字以内"}
+(vx の負値 = 後退。後退できるのは "move" のみ)
 
 ## 判断規則
 - 目標が画面中央 → "move"(遠ければvx=0.3、近ければ0.1〜0.15)。wzで方向微調整可。
+- 後退の任務(「下がって」「バックして」等) → "move" vx=-0.1。後方はカメラに映らない
+  ため、ハイトマップ画像の下側(ロボットの後方)に障害物がないことを確認してから下がる。
+  1回の判断で下がるのは小刻みに(vx=-0.1 なら次の判断まで最大0.08m)。完了したら "done"。
 - 目標が左寄り → "turn" wz>0(0.3〜0.5)。右寄り → wz<0。見えない → "turn" wz=0.4 で探索。
 - 目標の直前(前方障害物距離<0.5m、または目標が画面の下半分を占める)→ "stop"。
   停止後の次ターンで位置を確認し、良ければ "done"。
-- 人や動物が近い・落差・画像が真っ暗・状況が不明瞭 → 必ず "stop"。迷ったら "stop"。
+- 人・動物が進路上にいる、距離が判別できない、または横切る可能性がある → "stop"。
+  進路から十分外れ、静止していることが明確な場合だけ低速で継続する。
+- 落差・画像が真っ暗・状況が判別できない・系の異常(下記) → 必ず "stop"。迷ったら "stop"。
+  ただし「遠くに人が映っている」ことは不明瞭にも危険にも該当しない(上記の人・動物規則に従う)。
 - 画像が前ターンと変化していない、状況説明と画像が矛盾するなど、系の異常を疑ったら "stop"
   とし、reason にその旨を書くこと(勝手に前進しないこと)。
 - 任務が完了したと確信したら "done"。
@@ -146,7 +157,7 @@ def _extract_json(text):
     if d.get("action") not in ("move", "turn", "stop", "done"):
         d["action"] = "stop"
     try:
-        d["vx"] = max(0.0, min(VX_MAX, float(d.get("vx") or 0.0)))
+        d["vx"] = max(VX_MIN, min(VX_MAX, float(d.get("vx") or 0.0)))
         d["wz"] = max(-WZ_MAX, min(WZ_MAX, float(d.get("wz") or 0.0)))
     except (TypeError, ValueError):
         d["vx"], d["wz"] = 0.0, 0.0
@@ -235,6 +246,49 @@ def autonomy_sensor_error(bridge, now_s=None):
         return "LiDAR点密度が不足しています"
     if int(np.count_nonzero(np.isfinite(pts[:, :3]).all(axis=1))) < 20:
         return "finiteなLiDAR点が不足しています"
+    return None
+
+
+def autonomy_robot_state_error(bridge):
+    """自律command中に必要なLowState/姿勢契約をfail-closedで検査する。
+
+    LiDAR/odomが正常でも、LowState途絶や転倒姿勢では速度を許可しない。
+    実機はlow_ageと有限なroll/pitchを必須にし、mockでも提供された姿勢値は
+    同じ上限で検査する。
+    """
+    mock = bool(getattr(bridge, "mock", False))
+    bot = getattr(bridge, "bot", None)
+    if bot is None or not callable(getattr(bot, "state", None)):
+        return None if mock else "robot stateがありません"
+    try:
+        state = bot.state()
+    except Exception as exc:
+        return "robot state取得失敗: %s" % (exc,)
+    if not isinstance(state, dict):
+        return "robot stateが不正です"
+
+    if not mock:
+        try:
+            low_age = float(state.get("low_age", float("inf")))
+        except (TypeError, ValueError):
+            low_age = float("inf")
+        if (not np.isfinite(low_age) or low_age < 0 or
+                low_age > AUTONOMY_LOWSTATE_MAX_AGE_S):
+            return "lowstateがstaleです"
+
+    rpy = state.get("rpy")
+    if rpy is None:
+        return None if mock else "roll/pitchがありません"
+    try:
+        attitude = np.asarray(rpy[:2], dtype=np.float64)
+    except (TypeError, ValueError, IndexError):
+        attitude = np.asarray([], dtype=np.float64)
+    if attitude.shape != (2,) or not np.isfinite(attitude).all():
+        return "roll/pitchが不正です"
+    if abs(float(attitude[0])) > AUTONOMY_MAX_ROLL_RAD:
+        return "roll過大(%.2f rad)" % float(attitude[0])
+    if abs(float(attitude[1])) > AUTONOMY_MAX_PITCH_RAD:
+        return "pitch過大(%.2f rad)" % float(attitude[1])
     return None
 
 
@@ -372,6 +426,7 @@ class MissionAgent:
         self._hold_until = 0.0
         self._command_lock = threading.Lock()
         self._command_generation = 0
+        self._lifecycle_lock = threading.RLock()
         self._run_flag = False
         self._run_id = 0
         self._th = None
@@ -379,6 +434,8 @@ class MissionAgent:
         self.exploration_target = None
         self.gmap = None
         self.controller = None
+        self.map_lock = threading.RLock()
+        self.goal_spec = None
         self.guard = CollisionGuard()
         self.safety = {"safe": True, "reason": "hold"}
         self._last_safety_log = None
@@ -398,27 +455,65 @@ class MissionAgent:
 
     # ---------- 開始/中断 ----------
     def start(self, instruction: str):
-        if self._run_flag:
-            return "ミッション実行中です(先に中断してください)"
-        if not self.bridge.armed:
-            return "ARMしてください(DISARM中はミッション開始不可)"
         instruction = (instruction or "").strip()
         if not instruction:
             return "指示が空です"
         target = classify_exploration_request(instruction)
-        if target is None and not self.available:
-            return "claude CLIが見つかりません"
-        sensor_error = autonomy_sensor_error(self.bridge)
-        if sensor_error:
-            return "自律走行を開始できません: " + sensor_error
+        if target is not None:
+            return "探索はEXPLORE MAPで提案内容を確認してから開始してください"
+        with self._lifecycle_lock:
+            if self._run_flag:
+                return "ミッション実行中です(先に中断してください)"
+            if not self.bridge.armed:
+                return "ARMしてください(DISARM中はミッション開始不可)"
+            if not self.available:
+                return "claude CLIが見つかりません"
+            sensor_error = (autonomy_robot_state_error(self.bridge) or
+                            autonomy_sensor_error(self.bridge))
+            if sensor_error:
+                return "自律走行を開始できません: " + sensor_error
+            return self._launch_locked(instruction, "vlm", None, None)
+
+    def start_goal(self, spec: GoalSpec, executive=None):
+        """確認済み探索GoalSpecを再解釈せず、安全runnerへ一度だけ渡す。"""
+        if not isinstance(spec, GoalSpec):
+            return "GoalSpecが必要です"
+        if spec.intent is not Intent.EXPLORE_AND_MAP:
+            return "このrunnerはEXPLORE_AND_MAPのみ対応します"
+        if (not spec.confirmation.required or
+                spec.confirmation.status is not ConfirmationStatus.CONFIRMED):
+            return "探索GoalSpecは明示確認済みである必要があります"
+        if executive is None or getattr(
+                getattr(executive, "state", None), "name", "") != "EXPLORING":
+            return "Mission FSMがEXPLORING状態ではありません"
+        with self._lifecycle_lock:
+            if self._run_flag:
+                return "ミッション実行中です(先に中断してください)"
+            if not self.bridge.armed:
+                return "ARMしてください(DISARM中は探索開始不可)"
+            sensor_error = (autonomy_robot_state_error(self.bridge) or
+                            autonomy_sensor_error(self.bridge))
+            if sensor_error:
+                return "自律走行を開始できません: " + sensor_error
+            instruction = spec.transcript.text or "確認済み自律探索"
+            return self._launch_locked(
+                instruction, "explore", spec.target.ref, spec)
+
+    def _launch_locked(self, instruction, mode, target, spec):
+        """_lifecycle_lock保持中に1世代のrunner/keeperを起動する。"""
+        # 前runのhold/commandを次世代へ持ち越さない。lifecycle lock保持中に
+        # zero化してから新runを公開する。
+        self._stop_command()
         self.instruction = instruction
-        self.mode = "explore" if target is not None else "vlm"
+        self.mode = mode
         self.exploration_target = target
+        self.goal_spec = spec
         self.gmap = None
         self.controller = None
         self.safety = {"safe": True, "reason": "preflight passed"}
+        self._last_safety_log = None
         self.status = "running"
-        self.detail = "探索controller起動中…" if target is not None else "VLM起動中…"
+        self.detail = "探索controller起動中…" if mode == "explore" else "VLM起動中…"
         self.step = 0
         self.last = {}
         self.t0 = time.monotonic()
@@ -428,19 +523,23 @@ class MissionAgent:
         self._th = threading.Thread(target=self._run, args=(run_id,), daemon=True)
         self._th.start()
         threading.Thread(target=self._keeper, args=(run_id,), daemon=True).start()
-        deploy_log("mission_start", instruction=instruction, model=self.model)
+        deploy_log("mission_start", instruction=instruction, model=self.model,
+                   mode=mode, goal_id=(spec.goal_id if spec else None))
         return None
 
     def abort(self, why="user", expected_run_id=None):
-        if not self._run_flag:
-            return
-        if expected_run_id is not None and expected_run_id != self._run_id:
-            return
-        self._run_flag = False
-        self._run_id += 1  # blocked旧threadが次missionへ復活しないよう失効
-        self.status = "aborted"
-        self.detail = "中断: " + why
-        self._stop_command()
+        with self._lifecycle_lock:
+            if not self._run_flag:
+                return
+            if expected_run_id is not None and expected_run_id != self._run_id:
+                return
+            self._run_flag = False
+            self._run_id += 1  # blocked旧threadが次missionへ復活しないよう失効
+            self.status = "aborted"
+            self.detail = "中断: " + why
+            # run失効とzero commandをatomicにする。次run開始後に旧abortが
+            # commandを上書きする隙間を作らない。
+            self._stop_command()
         deploy_log("mission_abort", why=why)
 
     # ---------- 実行ループ ----------
@@ -486,8 +585,11 @@ class MissionAgent:
                 deadline = self._hold_until
                 generation = self._command_generation
             if now < deadline and any(command):
-                sensor = capture_autonomy_sensors(self.bridge)
-                err = autonomy_sensor_error(sensor, now)
+                robot_error = autonomy_robot_state_error(self.bridge)
+                sensor = (capture_autonomy_sensors(self.bridge)
+                          if robot_error is None else None)
+                err = (robot_error if robot_error is not None
+                       else autonomy_sensor_error(sensor, now))
                 assessment = None
                 if err is None:
                     try:
@@ -502,6 +604,17 @@ class MissionAgent:
                     except Exception as e:
                         err = "collision guardian error: %r" % (e,)
                 if err:
+                    # LowState/姿勢異常は一時停止ではなくrun世代ごと失効する。
+                    # VLM判断待ち中に一度転倒して復帰した場合も、古い判断を
+                    # 自動再開させない。run_id=Noneはkeeper単体test用。
+                    if robot_error is not None and run_id is not None:
+                        self.safety = {"safe": False, "reason": robot_error}
+                        self._last_safety_log = robot_error
+                        deploy_log("mission_guard_stop", reason=robot_error,
+                                   mode=self.mode, critical=True)
+                        self.abort("機体状態異常: " + robot_error,
+                                   expected_run_id=run_id)
+                        return
                     with self._command_lock:
                         unchanged = generation == self._command_generation
                     if unchanged:
@@ -541,24 +654,34 @@ class MissionAgent:
     def _run_exploration(self, run_id=None):
         """LiDAR global map + frontier/A* + guardianによる決定的な全域探索。"""
         try:
-            pose0 = self.bridge.pose
-            self.gmap = GlobalOccupancyMap(
-                size_m=(20.0, 20.0), resolution_m=0.10,
-                origin_xy=(float(pose0[0]) - 10.0, float(pose0[1]) - 10.0),
-                map_id="cockpit_explore_%d" % int(time.time()), frame_id="odom")
-            self.gmap.set_waypoint("home", (pose0[0], pose0[1], pose0[3]))
-            self.controller = ExplorationController(
-                self.gmap,
-                ExplorationControllerConfig(
-                    max_speed_mps=0.20,
-                    max_yaw_rate_rps=0.45,
-                    inflation_radius_m=0.30,
-                    max_goal_step_m=2.0,
-                    frontier_standoff_m=0.25,
-                    progress_timeout_s=3.0,
-                    complete_confirmations=3,
-                ),
-                collision_guard=self.guard)
+            sensor0 = capture_autonomy_sensors(self.bridge)
+            initial_error = (autonomy_robot_state_error(self.bridge) or
+                             autonomy_sensor_error(sensor0))
+            if initial_error:
+                self.abort("探索開始時センサ異常: " + initial_error,
+                           expected_run_id=run_id)
+                return
+            pose0 = sensor0.pose
+            with self.map_lock:
+                self.gmap = GlobalOccupancyMap(
+                    size_m=(20.0, 20.0), resolution_m=0.10,
+                    origin_xy=(float(pose0[0]) - 10.0,
+                               float(pose0[1]) - 10.0),
+                    map_id="cockpit_explore_%d" % int(time.time()),
+                    frame_id="odom")
+                self.gmap.set_waypoint("home", (pose0[0], pose0[1], pose0[3]))
+                self.controller = ExplorationController(
+                    self.gmap,
+                    ExplorationControllerConfig(
+                        max_speed_mps=0.20,
+                        max_yaw_rate_rps=0.45,
+                        inflation_radius_m=0.30,
+                        max_goal_step_m=2.0,
+                        frontier_standoff_m=0.25,
+                        progress_timeout_s=3.0,
+                        complete_confirmations=3,
+                    ),
+                    collision_guard=self.guard)
             last_cloud_ts = -1.0
             sensor_bad_since = None
             self.detail = "LiDAR global mapを構築中…"
@@ -574,12 +697,20 @@ class MissionAgent:
                     self.abort("探索タイムアウト(%ds)" % MISSION_TIMEOUT_S,
                                expected_run_id=run_id)
                     return
+                robot_error = autonomy_robot_state_error(self.bridge)
+                if robot_error:
+                    self.abort("機体状態異常: " + robot_error,
+                               expected_run_id=run_id)
+                    return
                 sensor = capture_autonomy_sensors(self.bridge)
                 err = autonomy_sensor_error(sensor, now_s)
                 if err:
-                    self._stop_command()
-                    self.safety = {"safe": False, "reason": err}
-                    self.detail = "センサ待機/停止: " + err
+                    with self._lifecycle_lock:
+                        if not self._run_is_active(run_id):
+                            return
+                        self._stop_command()
+                        self.safety = {"safe": False, "reason": err}
+                        self.detail = "センサ待機/停止: " + err
                     sensor_bad_since = sensor_bad_since or now_s
                     if now_s - sensor_bad_since > AUTONOMY_SENSOR_ABORT_S:
                         self.abort("センサ異常が継続: " + err,
@@ -593,58 +724,72 @@ class MissionAgent:
                 points = np.asarray(sensor.cloud_pts, dtype=np.float32)
                 cloud_ts = sensor.cloud_ts
                 now_ns = time.monotonic_ns()
-                if cloud_ts != last_cloud_ts:
-                    self.controller.integrate_point_cloud(
-                        pose, points, now_ns, max_range_m=8.0)
-                    last_cloud_ts = cloud_ts
-                    self.step += 1
+                with self.map_lock:
+                    if cloud_ts != last_cloud_ts:
+                        self.controller.integrate_point_cloud(
+                            pose, points, now_ns, max_range_m=8.0)
+                        last_cloud_ts = cloud_ts
+                        self.step += 1
 
-                ctl = self.controller.step(
-                    pose, now_ns, points_xyz=points,
-                    cloud_timestamp_s=cloud_ts,
-                    scan_valid=sensor.cloud_scan_valid,
-                    hazard=sensor.hazard)
-                self.last = {
-                    "action": ctl.status.value.lower(),
-                    "reason": ctl.reason,
-                    "vx": round(ctl.vx, 3), "wz": round(ctl.wz, 3),
-                    "goal": ([round(ctl.goal.x, 2), round(ctl.goal.y, 2)]
-                             if ctl.goal else None),
-                    "map_revision": ctl.map_revision,
-                }
-
-                if ctl.status is ControlStatus.COMPLETE:
-                    self._stop_command()
-                    self._run_flag = False
-                    self.status = "done"
-                    self.detail = "探索完了: 到達可能frontierなし(安定確認済み)"
-                    self.safety = {"safe": True, "reason": "active hold"}
-                    deploy_log("exploration_done", **self.controller.metrics())
-                    return
-
-                if ctl.moving:
-                    # controllerは10Hzで更新。更新停止時はbridge watchdogより前に失効。
-                    self._set_held_command((ctl.vx, ctl.vy, ctl.wz), 0.30)
-                    self.safety = {"safe": True, "reason": ctl.reason}
-                else:
-                    self._stop_command()
-                    if ctl.status is ControlStatus.STOP_SENSOR:
-                        self.safety = {"safe": False, "reason": ctl.reason}
-                    if ctl.status is ControlStatus.BLOCKED \
-                            and self.controller.blocked_cycles >= 20:
-                        self.abort("到達可能なfrontierがありません: " + ctl.reason,
-                                   expected_run_id=run_id)
+                    ctl = self.controller.step(
+                        pose, now_ns, points_xyz=points,
+                        cloud_timestamp_s=cloud_ts,
+                        scan_valid=sensor.cloud_scan_valid,
+                        hazard=sensor.hazard)
+                completed_metrics = None
+                with self._lifecycle_lock:
+                    # map計算中にSTOP/DISARMされた旧threadは、UI状態もcommandも
+                    # 一切更新せず終了する。
+                    if not self._run_is_active(run_id):
                         return
-                self.detail = ("探索 %s / %s / map=%s" %
-                               (ctl.status.value, ctl.reason, self.gmap.counts()))
+                    self.last = {
+                        "action": ctl.status.value.lower(),
+                        "reason": ctl.reason,
+                        "vx": round(ctl.vx, 3), "wz": round(ctl.wz, 3),
+                        "goal": ([round(ctl.goal.x, 2), round(ctl.goal.y, 2)]
+                                 if ctl.goal else None),
+                        "map_revision": ctl.map_revision,
+                    }
+
+                    if ctl.status is ControlStatus.COMPLETE:
+                        self._stop_command()
+                        self._run_flag = False
+                        self.status = "done"
+                        self.detail = "探索完了: 到達可能frontierなし(安定確認済み)"
+                        self.safety = {"safe": True, "reason": "active hold"}
+                        completed_metrics = self.controller.metrics()
+                    elif ctl.moving:
+                        # lifecycle→command lock順でpublish。abortとの前後関係を固定。
+                        self._set_held_command((ctl.vx, ctl.vy, ctl.wz), 0.30)
+                        self.safety = {"safe": True, "reason": ctl.reason}
+                        self.detail = ("探索 %s / %s / map=%s" %
+                                       (ctl.status.value, ctl.reason,
+                                        self.gmap.counts()))
+                    else:
+                        self._stop_command()
+                        if ctl.status is ControlStatus.STOP_SENSOR:
+                            self.safety = {"safe": False, "reason": ctl.reason}
+                        self.detail = ("探索 %s / %s / map=%s" %
+                                       (ctl.status.value, ctl.reason,
+                                        self.gmap.counts()))
+                        if ctl.status is ControlStatus.BLOCKED \
+                                and self.controller.blocked_cycles >= 20:
+                            self.abort(
+                                "到達可能なfrontierがありません: " + ctl.reason,
+                                expected_run_id=run_id)
+                            return
+                if completed_metrics is not None:
+                    deploy_log("exploration_done", **completed_metrics)
+                    return
                 time.sleep(EXPLORATION_LOOP_S)
         except Exception as e:
-            if not self._run_is_active(run_id):
-                return
-            self._run_flag = False
-            self.status = "error"
-            self.detail = "探索エラー: %s" % (e,)
-            self._stop_command()
+            with self._lifecycle_lock:
+                if not self._run_is_active(run_id):
+                    return
+                self._run_flag = False
+                self.status = "error"
+                self.detail = "探索エラー: %s" % (e,)
+                self._stop_command()
             deploy_log("exploration_error", error=repr(e))
 
     def _run_vlm(self, run_id=None):
@@ -661,7 +806,8 @@ class MissionAgent:
                     self.abort("タイムアウト(%ds)" % MISSION_TIMEOUT_S,
                                expected_run_id=run_id)
                     return
-                sensor_error = autonomy_sensor_error(self.bridge)
+                sensor_error = (autonomy_robot_state_error(self.bridge) or
+                                autonomy_sensor_error(self.bridge))
                 if sensor_error:
                     self.abort("センサ異常: " + sensor_error,
                                expected_run_id=run_id)
@@ -678,43 +824,54 @@ class MissionAgent:
                 t0 = time.time()
                 d = vlm.decide(prompt)
                 lat = time.time() - t0
-                if not self._run_is_active(run_id):
-                    return
-                self.last = {"action": d["action"], "reason": d.get("reason", ""),
-                             "vx": d.get("vx", 0), "wz": d.get("wz", 0),
-                             "latency": round(lat, 1)}
-                self.history.append(dict(self.last, step=self.step))
-                deploy_log("mission_step", step=self.step, **self.last)
+                done = False
+                with self._lifecycle_lock:
+                    if not self._run_is_active(run_id):
+                        return
+                    self.last = {
+                        "action": d["action"], "reason": d.get("reason", ""),
+                        "vx": d.get("vx", 0), "wz": d.get("wz", 0),
+                        "latency": round(lat, 1),
+                    }
+                    self.history.append(dict(self.last, step=self.step))
+                    deploy_log("mission_step", step=self.step, **self.last)
 
-                a = d["action"]
-                if a == "move":
-                    self._set_held_command(
-                        (d["vx"], 0.0, d["wz"] * 0.5), HOLD_MOVE_S)
-                    last_note = "move vx=%.2f wz=%.2f (%s)" % (d["vx"], d["wz"], d.get("reason", ""))
-                elif a == "turn":
-                    # 見失い時の探索旋回へ前進を混ぜない。旧実装は正面の
-                    # 障害物へ0.1m/sで押し付ける経路になっていた。
-                    self._set_held_command(
-                        (0.0, 0.0, d["wz"] if d["wz"] else 0.4), HOLD_TURN_S)
-                    last_note = "turn wz=%.2f (%s)" % (d["wz"], d.get("reason", ""))
-                elif a == "stop":
-                    self._stop_command()
-                    last_note = "stop (%s)" % d.get("reason", "")
-                elif a == "done":
-                    self._stop_command()
-                    self._run_flag = False
-                    self.status = "done"
-                    self.detail = "完了: " + d.get("reason", "")
+                    a = d["action"]
+                    if a == "move":
+                        self._set_held_command(
+                            (d["vx"], 0.0, d["wz"] * 0.5), HOLD_MOVE_S)
+                        last_note = "move vx=%.2f wz=%.2f (%s)" % (
+                            d["vx"], d["wz"], d.get("reason", ""))
+                    elif a == "turn":
+                        # 見失い時の探索旋回へ前進を混ぜない。
+                        self._set_held_command(
+                            (0.0, 0.0, d["wz"] if d["wz"] else 0.4),
+                            HOLD_TURN_S)
+                        last_note = "turn wz=%.2f (%s)" % (
+                            d["wz"], d.get("reason", ""))
+                    elif a == "stop":
+                        self._stop_command()
+                        last_note = "stop (%s)" % d.get("reason", "")
+                    elif a == "done":
+                        self._stop_command()
+                        self._run_flag = False
+                        self.status = "done"
+                        self.detail = "完了: " + d.get("reason", "")
+                        done = True
+                    if not done:
+                        self.detail = "ステップ%d: %s実行中 (%s)" % (
+                            self.step, a, d.get("reason", ""))
+                if done:
                     deploy_log("mission_done", steps=self.step)
                     return
-                self.detail = "ステップ%d: %s実行中 (%s)" % (self.step, a, d.get("reason", ""))
         except Exception as e:
-            if not self._run_is_active(run_id):
-                return
-            self._run_flag = False
-            self.status = "error"
-            self.detail = "エラー: %s" % (e,)
-            self._stop_command()
+            with self._lifecycle_lock:
+                if not self._run_is_active(run_id):
+                    return
+                self._run_flag = False
+                self.status = "error"
+                self.detail = "エラー: %s" % (e,)
+                self._stop_command()
             deploy_log("mission_error", error=repr(e))
         finally:
             if vlm:

@@ -7,6 +7,7 @@
   - stateless ``next_goal`` は互換API。実運用は履歴を持つ ``FrontierExplorer`` を使う。
   - 本moduleはgoal/pathを提案するだけで、最終的な速度許可はlocal collision
     guardianが毎tick判断する。
+  - 旧APIのrng引数は互換のため受理するが、LIVE選択は決定的にする。
 """
 import heapq
 import math
@@ -227,17 +228,31 @@ def next_goal(gmap: GlobalOccupancyMap, robot_xy,
               visit_counts: Optional[np.ndarray] = None,
               recent_goal_cells: Sequence[Cell] = (),
               failed_goal_cells: Iterable[Cell] = (),
-              now_ns=None, max_age_ns=None) -> ExplorationDecision:
+              now_ns=None, max_age_ns=None,
+              optimistic: bool = False,
+              min_goal_dist_m: float = 0.0,
+              avoid_xy: Sequence[WorldPoint] = (),
+              avoid_radius_m: float = 0.5,
+              rng=None) -> ExplorationDecision:
     """reachable frontierへ至るpath付きgoalを決定的に返す。
 
     小clusterは優先度を下げるだけで捨てない。frontierが存在するのにfilter後が
     空になった状態をCOMPLETEと誤判定しない。
+
+    optimisticは旧API互換で受理するが、LIVE plannerではUNKNOWNを通行可に
+    しない。min_goal_dist_m/avoid_xyはFREE-only A*候補へだけ適用する。
+    rngは旧呼び出し互換のため検証だけ行い、goal選択には使わない。
     """
     if not isinstance(gmap, GlobalOccupancyMap):
         raise ContractViolation("gmap", "GlobalOccupancyMap が必要")
     if min_cluster_cells <= 0 or max_step_m <= 0 or standoff_m < 0 \
-            or min_progress_m < 0:
+            or min_progress_m < 0 or min_goal_dist_m < 0 \
+            or avoid_radius_m < 0:
         raise ContractViolation("planner_config", "距離/cluster設定が不正")
+    if not isinstance(optimistic, (bool, np.bool_)):
+        raise ContractViolation("optimistic", "boolが必要")
+    if rng is not None and not callable(getattr(rng, "random", None)):
+        raise ContractViolation("rng", "random()を持つ必要")
     counts = gmap.counts()
     if counts["free"] == 0:
         return ExplorationDecision(ExplorationStatus.NO_OBSERVATIONS, None,
@@ -290,18 +305,24 @@ def next_goal(gmap: GlobalOccupancyMap, robot_xy,
             if len(full_path) < 2:
                 continue
             full_length = _path_length_cells(full_path, gmap.resolution_m)
-            # frontierへ直接踏み込まず、既知FREE側へstandoffする。
-            view_length = max(min_progress_m, full_length - standoff_m)
-            view_path = _truncate_path(full_path, gmap.resolution_m, view_length)
-            if len(view_path) < 2:
+            # frontierへ直接踏み込まず、かつ1 goalのpath長をmax_stepへ制限する。
+            # failure/recent/visitは遠方の最終viewpointではなく、このrunが実際に
+            # 目指す切り詰め後goalへ適用する。同じ中間goalの再発行を防ぐ。
+            target_length = min(
+                max_step_m,
+                max(min_progress_m, full_length - standoff_m),
+            )
+            candidate_path = _truncate_path(
+                full_path, gmap.resolution_m, target_length)
+            if len(candidate_path) < 2:
                 continue
-            goal_cell = view_path[-1]
+            goal_cell = candidate_path[-1]
             # failure stateにはfrontier cellではなく実際に停止したviewpoint
             # (goal_cell)を保存する。同じ近傍のfrontier表現へ名前を変えて
             # 即再試行する抜け道もradiusで塞ぐ。
             if _near_any(goal_cell, failed, revisit_radius):
                 continue
-            path_len = _path_length_cells(view_path, gmap.resolution_m)
+            path_len = _path_length_cells(candidate_path, gmap.resolution_m)
             if path_len < min_progress_m - 1e-9:
                 continue
             gain = _unknown_gain(gmap, fc)
@@ -315,22 +336,22 @@ def next_goal(gmap: GlobalOccupancyMap, robot_xy,
                 utility -= 25.0
             if not preferred_size:
                 utility -= 2.0
+            goal_xy = gmap.cell_to_world(*goal_cell)
+            if any(math.hypot(goal_xy[0] - float(ax),
+                              goal_xy[1] - float(ay)) < avoid_radius_m
+                   for ax, ay in avoid_xy):
+                continue
+            if path_len < max(min_progress_m, min_goal_dist_m) - 1e-9:
+                continue
             candidates.append((-utility, visits, recent, full_length,
                                fc[1], fc[0], cluster_index, cluster,
-                               fc, full_path))
+                               fc, candidate_path))
 
     if not candidates:
         return ExplorationDecision(ExplorationStatus.NO_REACHABLE_FRONTIER, None,
                                    "frontierはあるがinflate済みFREE pathがない")
     candidates.sort(key=lambda row: row[:7])
-    _, _, _, _, _, _, _, cluster, frontier_cell, full_path = candidates[0]
-
-    full_length = _path_length_cells(full_path, gmap.resolution_m)
-    target_length = min(max_step_m, max(min_progress_m, full_length - standoff_m))
-    path_cells = _truncate_path(full_path, gmap.resolution_m, target_length)
-    if len(path_cells) < 2:
-        return ExplorationDecision(ExplorationStatus.NO_REACHABLE_FRONTIER, None,
-                                   "frontierまでの安全な進捗が不足")
+    _, _, _, _, _, _, _, cluster, frontier_cell, path_cells = candidates[0]
     goal_cell = path_cells[-1]
     path_world = tuple(gmap.cell_to_world(x, y) for x, y in path_cells)
     gx, gy = path_world[-1]
@@ -347,6 +368,37 @@ def next_goal(gmap: GlobalOccupancyMap, robot_xy,
                         path=path_world, path_length_m=path_length,
                         goal_cell=goal_cell, frontier_cell=frontier_cell),
         reason)
+
+
+def _clip_along_ray(gmap: GlobalOccupancyMap, traversable: np.ndarray,
+                    start_xy, goal_xy, max_step_m: float):
+    """互換用の保守的な直線clip。
+
+    渡されたmask上で最初の非通行cellより先へ進まない。LIVEのfrontier計画は
+    このhelperではなく、上のFREE-only Dijkstra/A* pathを使う。
+    """
+    if traversable.shape != gmap.grid.shape:
+        raise ContractViolation("traversable", "mapと同じshapeが必要")
+    if max_step_m <= 0:
+        raise ContractViolation("max_step_m", "正の値が必要")
+    sx, sy = float(start_xy[0]), float(start_xy[1])
+    gx, gy = float(goal_xy[0]), float(goal_xy[1])
+    distance = math.hypot(gx - sx, gy - sy)
+    if distance <= 0:
+        return None
+    samples = max(2, int(math.ceil(distance / gmap.resolution_m)) * 2)
+    best = None
+    for i in range(1, samples + 1):
+        t = i / samples
+        x = sx + (gx - sx) * t
+        y = sy + (gy - sy) * t
+        if math.hypot(x - sx, y - sy) > max_step_m + 1e-12:
+            break
+        cell = gmap.world_to_cell(x, y)
+        if cell is None or not traversable[cell[1], cell[0]]:
+            break
+        best = (x, y)
+    return best
 
 
 class FrontierExplorer:

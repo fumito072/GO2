@@ -19,32 +19,60 @@ class Transcriber:
     def __init__(self, model_size="small"):
         self.model_size = model_size
         self._model = None
+        self.device = None
         self.error = None
         self._lock = threading.Lock()
         threading.Thread(target=self._load, daemon=True).start()
 
     def _load(self):
-        try:
-            from faster_whisper import WhisperModel
-            m = WhisperModel(self.model_size, device="cpu", compute_type="int8")
-            self._model = m
-            print("[voice] whisper '%s' ロード完了" % self.model_size)
-        except Exception as e:
-            self.error = repr(e)
-            print("[voice] whisperロード失敗: %s" % self.error)
+        # エッジ機のGPU(int8)を優先し、CUDA不可ならCPUへフォールバック(docs/12 §4)。
+        from faster_whisper import WhisperModel
+        for device in ("cuda", "cpu"):
+            try:
+                m = WhisperModel(self.model_size, device=device,
+                                 compute_type="int8")
+                self._model = m
+                self.device = device
+                print("[voice] whisper '%s' ロード完了 (device=%s)"
+                      % (self.model_size, device))
+                return
+            except Exception as e:
+                self.error = repr(e)
+                print("[voice] whisper(%s)ロード失敗: %s" % (device, self.error))
 
     @property
     def ready(self):
         return self._model is not None
 
     def transcribe(self, path: str) -> str:
+        return self.transcribe_ex(path)[0]
+
+    def transcribe_ex(self, path: str):
+        """文字起こし + 品質エビデンス。
+
+        戻り値: (text, {"quality": 0..1, "no_speech": 0..1})
+        quality は segment avg_logprob の指数平均、no_speech は
+        no_speech_prob の平均。契約パーサの TranscriptEvidence 用
+        (VOICE modality では必須, contracts/goal_spec.py)。
+        """
+        import math
         if self._model is None:
             raise RuntimeError(self.error or "モデルロード中です。少し待ってください")
         with self._lock:  # ctranslate2は同時実行しない
             segments, _info = self._model.transcribe(
                 path, language="ja", beam_size=1, vad_filter=True,
                 condition_on_previous_text=False)
-            return "".join(s.text for s in segments).strip()
+            segs = list(segments)
+        text = "".join(s.text for s in segs).strip()
+        if segs:
+            avg_lp = sum(s.avg_logprob for s in segs) / len(segs)
+            quality = max(0.0, min(1.0, math.exp(avg_lp)))
+            no_speech = max(0.0, min(1.0, sum(s.no_speech_prob for s in segs)
+                                     / len(segs)))
+        else:
+            quality, no_speech = 0.0, 1.0
+        return text, {"quality": round(quality, 4),
+                      "no_speech": round(no_speech, 4)}
 
 
 def _norm(text: str) -> str:

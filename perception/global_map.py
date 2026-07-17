@@ -20,6 +20,14 @@ UNKNOWN = 0
 FREE = 1
 OCCUPIED = 2
 
+# 証拠カウンタ(2026-07-17: 動的障害物対策)。OCCUPIED cell はヒットで加点・
+# ray 通過(=そこは空いていた証拠)で減点し、尽きたら FREE へ降格する。
+# 実在の壁は観測のたび再加点されるので維持され、人の脚などの動的障害物や
+# ノイズは数フレームで消える(地図の自己修正)。
+OCC_HIT = 2        # 障害物ヒット1回の加点
+OCC_MAX = 6        # 加点上限(降格には最低3回の通過証拠が必要)
+HAZARD_SCORE = 100 # drop hazard 用。50 超は減衰・降格させない(安全側で永続)
+
 SCHEMA_VERSION = "1.0"
 OCCUPIED_CLEAR_MISSES = 3
 
@@ -71,8 +79,45 @@ class GlobalOccupancyMap:
         self.free_evidence = np.zeros((self.height, self.width), dtype=np.uint8)
         # drop/段差などsemantic hazardはLiDAR missで解除しない別layer。
         self.hazard_mask = np.zeros((self.height, self.width), dtype=bool)
+        # 旧artifact/診断UIとの互換値。解除判定はocc_scoreではなく、上記の
+        # scan単位free_evidenceを唯一の根拠にする。
+        self.occ_score = np.zeros((self.height, self.width), dtype=np.int16)
         self.waypoints = {}  # name -> (x, y, yaw)
         self.revision = 0    # occupancy/free state が変化した回数(path invalidation用)
+
+    # ---------- 証拠カウンタ(cell 単位のヒット/ミス) ----------
+
+    def _ray_hit(self, ix: int, iy: int, now_ns: int) -> int:
+        """互換用の単cell hit。通常はscan単位のintegrate_scanを使う。"""
+        s = self.occ_score[iy, ix]
+        if not self.hazard_mask[iy, ix]:
+            self.occ_score[iy, ix] = min(OCC_MAX, max(int(s), 0) + OCC_HIT)
+        changed = int(self.grid[iy, ix] != OCCUPIED)
+        self.grid[iy, ix] = OCCUPIED
+        self.age_ns[iy, ix] = now_ns
+        self.free_evidence[iy, ix] = 0
+        return changed
+
+    def _ray_miss(self, ix: int, iy: int, now_ns: int) -> int:
+        """互換用の単cell miss。呼出し1回を独立scan 1回として数える。"""
+        if self.hazard_mask[iy, ix]:
+            return 0
+        if self.grid[iy, ix] == OCCUPIED:
+            evidence = min(255, int(self.free_evidence[iy, ix]) + 1)
+            self.free_evidence[iy, ix] = evidence
+            self.age_ns[iy, ix] = now_ns
+            if evidence >= OCCUPIED_CLEAR_MISSES:
+                self.grid[iy, ix] = FREE
+                self.occ_score[iy, ix] = 0
+                self.free_evidence[iy, ix] = 0
+                return 1
+            return 0
+        changed = int(self.grid[iy, ix] != FREE)
+        self.grid[iy, ix] = FREE
+        self.age_ns[iy, ix] = now_ns
+        self.occ_score[iy, ix] = 0
+        self.free_evidence[iy, ix] = 0
+        return changed
 
     # ---------- 座標変換 ----------
 
@@ -190,6 +235,7 @@ class GlobalOccupancyMap:
                 if evidence >= OCCUPIED_CLEAR_MISSES:
                     self.grid[iy, ix] = FREE
                     self.age_ns[iy, ix] = now_ns
+                    self.occ_score[iy, ix] = 0
                     self.free_evidence[iy, ix] = 0
                     updated += 1
             else:
@@ -197,23 +243,41 @@ class GlobalOccupancyMap:
                     updated += 1
                 self.grid[iy, ix] = FREE
                 self.age_ns[iy, ix] = now_ns
+                self.occ_score[iy, ix] = 0
                 self.free_evidence[iy, ix] = 0
         for ix, iy in sorted(hit_seen, key=lambda c: (c[1], c[0])):
             if self.grid[iy, ix] != OCCUPIED:
                 updated += 1
             self.grid[iy, ix] = OCCUPIED
             self.age_ns[iy, ix] = now_ns
+            if not self.hazard_mask[iy, ix]:
+                self.occ_score[iy, ix] = min(
+                    OCC_MAX, max(0, int(self.occ_score[iy, ix])) + OCC_HIT)
             self.free_evidence[iy, ix] = 0
-        # robot 自身の cell は実在するFREE。self-return/過去の動体点で
-        # OCCUPIEDになっていても解除し、plannerを閉じ込めない。
-        if self.grid[rc[1], rc[0]] != FREE:
-            updated += 1
-        self.grid[rc[1], rc[0]] = FREE
-        self.age_ns[rc[1], rc[0]] = now_ns
-        self.free_evidence[rc[1], rc[0]] = 0
+        # robot cellの通常のself-returnは解除する。ただしdrop/段差hazardを
+        # footprintだけで消すと、pose driftや誤分類時に落下側へ倒れるため保持する。
+        if not self.hazard_mask[rc[1], rc[0]]:
+            if self.grid[rc[1], rc[0]] != FREE:
+                updated += 1
+            self.grid[rc[1], rc[0]] = FREE
+            self.age_ns[rc[1], rc[0]] = now_ns
+            self.occ_score[rc[1], rc[0]] = 0
+            self.free_evidence[rc[1], rc[0]] = 0
         if updated:
             self.revision += 1
         return updated
+
+    def integrate_free_rays(self, robot_xy, points_xy, now_ns: int,
+                            max_range_m: float = 8.0) -> int:
+        """床return/no-returnを端点までFREEとしてscan単位で統合する。
+
+        同じcallback内で何本のrayが同一cellを通っても解除証拠は1回分だけ。
+        map外endpointは境界までのFREE観測を保持する。
+        """
+        points = list(points_xy)
+        return self.integrate_scan(robot_xy, points, now_ns,
+                                   max_range_m=max_range_m,
+                                   hit_mask=[False] * len(points))
 
     def integrate_point_cloud(self, robot_pose, points_xyz, now_ns: int,
                               max_range_m: float = 8.0,
@@ -265,7 +329,8 @@ class GlobalOccupancyMap:
 
     def mark_hazard(self, points_xy, now_ns: int) -> None:
         """elevation 分類(step/drop 等)による進入禁止 cell を OCCUPIED にする
-        (docs/10 §5: drop/段差は costmap 上 OCCUPIED 扱い)。"""
+        (docs/10 §5: drop/段差は costmap 上 OCCUPIED 扱い)。
+        hazard は証拠カウンタの減衰対象外(ray が通過しても消えない — 安全側)。"""
         if not isinstance(now_ns, int) or isinstance(now_ns, bool) or now_ns <= 0:
             raise ContractViolation("now_ns", "正の monotonic ns が必要")
         changed = False
@@ -274,9 +339,38 @@ class GlobalOccupancyMap:
             if c is not None:
                 changed = changed or self.grid[c[1], c[0]] != OCCUPIED
                 self.grid[c[1], c[0]] = OCCUPIED
+                self.occ_score[c[1], c[0]] = HAZARD_SCORE
                 self.age_ns[c[1], c[0]] = now_ns
                 self.free_evidence[c[1], c[0]] = 0
                 self.hazard_mask[c[1], c[0]] = True
+        if changed:
+            self.revision += 1
+
+    def clear_footprint(self, robot_xy, radius_m: float, now_ns: int) -> None:
+        """robot が物理的に立っている円盤を FREE にする(2026-07-18)。
+
+        通常OCCUPIEDだけを浄化する。semantic hazardはpose drift時の落下防止の
+        ため保持し、再分類または明示的なmap resetでのみ解除する。"""
+        if not isinstance(now_ns, int) or isinstance(now_ns, bool) or now_ns <= 0:
+            raise ContractViolation("now_ns", "正の monotonic ns が必要")
+        rc = self.world_to_cell(float(robot_xy[0]), float(robot_xy[1]))
+        if rc is None:
+            return
+        r = int(radius_m / self.resolution_m)
+        changed = False
+        for dj in range(-r, r + 1):
+            for di in range(-r, r + 1):
+                if di * di + dj * dj > r * r:
+                    continue
+                ix, iy = rc[0] + di, rc[1] + dj
+                if 0 <= ix < self.width and 0 <= iy < self.height:
+                    if self.hazard_mask[iy, ix]:
+                        continue
+                    changed = changed or self.grid[iy, ix] != FREE
+                    self.grid[iy, ix] = FREE
+                    self.occ_score[iy, ix] = 0
+                    self.free_evidence[iy, ix] = 0
+                    self.age_ns[iy, ix] = now_ns
         if changed:
             self.revision += 1
 
@@ -298,12 +392,15 @@ class GlobalOccupancyMap:
 
     def traversable_mask(self, inflate_cells: int = 3,
                          inflation_radius_m=None,
-                         now_ns=None, max_age_ns=None) -> np.ndarray:
+                         now_ns=None, max_age_ns=None,
+                         optimistic: bool = False) -> np.ndarray:
         """通行可能 = FREE のみ(UNKNOWN は通行不可 — invariant 9)。
         OCCUPIED はrobot footprint相当を膨張させる。
 
         inflation_radius_mを指定した場合はresolutionに依存しない物理marginを使う。
         now_ns/max_age_nsを指定した場合、古いFREEはUNKNOWN相当として通行不可。
+        optimistic=Trueは地図可視化/旧API互換の照会専用でUNKNOWNも含める。
+        LIVE経路計画では使用してはならず、freshness指定時は常にFREEのみとする。
         """
         if inflation_radius_m is not None:
             if not np.isfinite(inflation_radius_m) or inflation_radius_m < 0:
@@ -314,6 +411,8 @@ class GlobalOccupancyMap:
             raise ContractViolation("inflate_cells", "0以上のintが必要")
         if (now_ns is None) != (max_age_ns is None):
             raise ContractViolation("freshness", "now_nsとmax_age_nsは同時指定")
+        if not isinstance(optimistic, (bool, np.bool_)):
+            raise ContractViolation("optimistic", "boolが必要")
         occ = (self.grid == OCCUPIED)
         if inflate_cells > 0:
             # Euclidean disk。従来の4近傍diamondより対角footprintを保護する。
@@ -329,7 +428,8 @@ class GlobalOccupancyMap:
                     dx0, dx1 = sx0 + dx, sx1 + dx
                     inflated[dy0:dy1, dx0:dx1] |= occ[sy0:sy1, sx0:sx1]
             occ = inflated
-        free = (self.grid == FREE)
+        free = ((self.grid != OCCUPIED) if optimistic and now_ns is None
+                else (self.grid == FREE))
         if now_ns is not None:
             if not isinstance(now_ns, int) or isinstance(now_ns, bool) or now_ns <= 0:
                 raise ContractViolation("now_ns", "正のmonotonic nsが必要")
@@ -354,6 +454,7 @@ class GlobalOccupancyMap:
             "age_ns": self.age_ns.tolist(),
             "free_evidence": self.free_evidence.tolist(),
             "hazard_mask": self.hazard_mask.tolist(),
+            "occ_score": self.occ_score.tolist(),
             "waypoints": {k: list(v) for k, v in self.waypoints.items()},
             "revision": self.revision,
         }
@@ -390,7 +491,17 @@ class GlobalOccupancyMap:
             d.get("hazard_mask", np.zeros((h, w), dtype=bool)), dtype=bool)
         if hazard_mask.shape != (h, w):
             raise ContractViolation("hazard_mask", "shape 不一致")
+        if np.any(hazard_mask & (grid != OCCUPIED)):
+            raise ContractViolation("hazard_mask", "hazard cellはOCCUPIED必須")
         m.hazard_mask = hazard_mask
+        default_score = np.where(
+            hazard_mask, HAZARD_SCORE,
+            np.where(grid == OCCUPIED, OCC_MAX, 0)).astype(np.int16)
+        occ_score = np.asarray(d.get("occ_score", default_score), dtype=np.int16)
+        if occ_score.shape != (h, w) or (occ_score < 0).any():
+            raise ContractViolation("occ_score", "shape不一致または負値")
+        occ_score[hazard_mask] = HAZARD_SCORE
+        m.occ_score = occ_score
         revision = d.get("revision", 0)
         if not isinstance(revision, int) or isinstance(revision, bool) or revision < 0:
             raise ContractViolation("revision", "0以上のintが必要")

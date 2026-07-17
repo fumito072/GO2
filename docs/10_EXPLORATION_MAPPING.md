@@ -97,8 +97,8 @@ provenance: {run_id, odom_source, git_commit}
 cell freshness、独立local collision guardianを使用する。Cockpitの探索入力も
 `GlobalOccupancyMap → ExplorationController → guardian → RobotBridge`へ接続済み。
 
-原因、実装契約、275件のtestとcollision付きE2Eの結果は
-[12_EXPLORATION_SAFETY_IMPLEMENTATION.md](12_EXPLORATION_SAFETY_IMPLEMENTATION.md)
+原因、実装契約、全自動testとcollision付きE2Eの最新結果は
+[13_EXPLORATION_SAFETY_IMPLEMENTATION.md](13_EXPLORATION_SAFETY_IMPLEMENTATION.md)
 を正本とする。なお、設計上のCommand Arbiter/Exclusive Actuation Gatewayを
 Cockpit I/O adapterへ統合する作業は残るため、guardian/TTL/watchdogを外した状態を
 LIVE許可しない。

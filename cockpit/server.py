@@ -32,10 +32,13 @@ sys.path.insert(0, __file__.rsplit("cockpit", 1)[0])
 from common import config  # noqa: E402
 from common.go2_iface import make_robot, SDK_JOINT_NAMES  # noqa: E402
 from common.safety import deploy_log  # noqa: E402
-from cockpit.mission import DEFAULT_MODEL, MissionAgent  # noqa: E402
+from cockpit.mission import (  # noqa: E402
+    DEFAULT_MODEL, MissionAgent, classify_exploration_request,
+)
 from cockpit.rl_bridge import RlController  # noqa: E402
 from cockpit.stair import detect_stair  # noqa: E402
 from cockpit.stair_task import StairTask  # noqa: E402
+from cockpit.explore_task import ExploreTask  # noqa: E402
 from cockpit.voice import Transcriber, parse_intent  # noqa: E402
 from m2_navila.elevation_node import RollingElevationMap, parse_pointcloud2, quat_to_yaw  # noqa: E402
 
@@ -161,6 +164,27 @@ class RobotBridge:
             self._odom_sub.Init(self._on_odom, 10)
         except Exception as e:
             print("[cockpit] odom購読失敗(%r) → sportmodestateにフォールバック" % (e,))
+        # LiDAR keepalive(実機 2026-07-18 03:02: cloud_deskewed が途中で配信
+        # 停止 → rt/utlidar/switch に ON を送ると復旧した)。ON は冪等な
+        # センサ有効化コマンドなので5秒毎に送り続けて再発を防ぐ
+        try:
+            from unitree_sdk2py.core.channel import ChannelPublisher
+            from unitree_sdk2py.idl.std_msgs.msg.dds_ import String_
+            self._lidar_sw = ChannelPublisher("rt/utlidar/switch", String_)
+            self._lidar_sw.Init()
+            self._lidar_sw_msg = String_
+            threading.Thread(target=self._lidar_keepalive,
+                             daemon=True).start()
+        except Exception as e:
+            print("[cockpit] LiDAR keepalive初期化失敗(%r)" % (e,))
+
+    def _lidar_keepalive(self):
+        while True:
+            try:
+                self._lidar_sw.Write(self._lidar_sw_msg(data="ON"))
+            except Exception:
+                pass
+            time.sleep(5.0)
 
     def _update_vel(self, x, y, z):
         """odom位置の微分 → world系 base線速度(1次ローパス)。
@@ -366,6 +390,16 @@ class RobotBridge:
         ]).astype(np.float32)
         surfaces.append(front)
 
+        # 背面壁(x=-3)。地上フロアを閉じ、自律探索が有限領域で
+        # frontier枯渇 → EXPLORATION_COMPLETE に到達できるようにする(E2検証)。
+        back_x = np.float32(-3.0)
+        BY, BH = np.meshgrid(gy, wall_h, indexing="ij")
+        surfaces.append(np.column_stack([
+            np.full(BY.size, back_x, np.float32),
+            BY.ravel(),
+            cls._mock_ground(back_x) + BH.ravel(),
+        ]).astype(np.float32))
+
         # z=f(x)では生成できない垂直な蹴上げ面を各段へ追加。
         riser_y = np.arange(-1.08, 1.081, spacing, dtype=np.float32)
         for i in range(cls.MOCK_N_STEP):
@@ -505,22 +539,44 @@ class RobotBridge:
 
     def set_cmd(self, vx, vy, wz):
         lim = config.VEL_LIMIT
+        try:
+            values = (float(vx), float(vy), float(wz))
+        except (TypeError, ValueError):
+            values = (float("nan"),) * 3
+        valid = all(math.isfinite(v) for v in values)
         with self._lock:
-            self.cmd = [max(lim["vx"][0], min(lim["vx"][1], float(vx))),
-                        max(lim["vy"][0], min(lim["vy"][1], float(vy))),
-                        max(lim["wz"][0], min(lim["wz"][1], float(wz)))]
+            if valid:
+                self.cmd = [
+                    max(lim["vx"][0], min(lim["vx"][1], values[0])),
+                    max(lim["vy"][0], min(lim["vy"][1], values[1])),
+                    max(lim["wz"][0], min(lim["wz"][1], values[2])),
+                ]
+            else:
+                # NaNはPythonのmin/maxで上限値へ化け得る。非有限/変換不能は
+                # clampせず、必ずzero commandへ倒す。
+                self.cmd = [0.0, 0.0, 0.0]
             self.cmd_ts = time.monotonic()
+        if not valid:
+            try:
+                self.bot.stop_move()
+            except Exception:
+                pass
+            deploy_log("cockpit_cmd_rejected", reason="non-finite command")
+        return valid
 
     def set_armed(self, on: bool):
+        valid = isinstance(on, bool)
+        on = on if valid else False
         with self._lock:
-            self.armed = bool(on)
+            self.armed = on
             self.cmd = [0.0, 0.0, 0.0]
         if not on:
             try:
                 self.bot.stop_move()
             except Exception:
                 pass
-        deploy_log("cockpit_arm", on=bool(on))
+        deploy_log("cockpit_arm", on=on, valid=valid)
+        return valid
 
     def do_action(self, name: str) -> str:
         """stop/damp はARM不問。姿勢系はARM時のみ。"""
@@ -626,17 +682,24 @@ class RobotBridge:
 
 def build_app(bridge: RobotBridge, transcriber: Transcriber = None,
               mission: MissionAgent = None, stair: StairTask = None,
-              rl: RlController = None):
+              rl: RlController = None, explore: ExploreTask = None):
     from aiohttp import web, WSMsgType
 
     def abort_autonomy(why):
-        """自律系(AI任務/登坂タスク/RL方策)をまとめて中断。"""
+        """自律系(AI任務/登坂タスク/RL方策/探索)をまとめて中断。"""
         if mission is not None:
             mission.abort(why)
         if stair is not None:
             stair.abort(why)
         if rl is not None and rl.is_running():
             rl.stop(why)
+        if explore is not None:
+            explore.abort(why)
+
+    def stair_busy():
+        return getattr(stair, "state", "idle") in (
+            "starting", "scan", "align", "approach", "confirm",
+            "climb", "settle", "handoff")
 
     def _asset_ver(name):
         try:
@@ -675,7 +738,8 @@ def build_app(bridge: RobotBridge, transcriber: Transcriber = None,
             path = f.name
         try:
             loop = asyncio.get_event_loop()
-            text = await loop.run_in_executor(None, transcriber.transcribe, path)
+            text, evidence = await loop.run_in_executor(
+                None, transcriber.transcribe_ex, path)
         except Exception as e:
             return web.json_response({"error": "認識失敗: %r" % (e,)}, status=500)
         finally:
@@ -683,6 +747,19 @@ def build_app(bridge: RobotBridge, transcriber: Transcriber = None,
                 os.unlink(path)
             except OSError:
                 pass
+        # 一段目: 契約パーサ(voice_gateway.intent_parser)。STOP_NOW 即時、
+        # 移動 goal は確認フロー。命令でない発話のみ旧ルールベースへ。
+        goal = None
+        if explore is not None:
+            goal = explore.route_text(text, modality="voice", evidence=evidence)
+        if goal is not None and goal.get("handled"):
+            intent = ({"action": "stop", "say": goal["say"]}
+                      if goal["kind"] == "stop_now"
+                      else {"action": "none", "say": goal["say"]})
+            deploy_log("cockpit_voice", text=text, intent=intent.get("action"),
+                       goal_kind=goal["kind"])
+            return web.json_response({"text": text, "intent": intent,
+                                      "goal": goal})
         intent = parse_intent(text)
         deploy_log("cockpit_voice", text=text, intent=intent.get("action"))
         return web.json_response({"text": text, "intent": intent})
@@ -729,6 +806,8 @@ def build_app(bridge: RobotBridge, transcriber: Transcriber = None,
                         t["stair_task"] = stair.snapshot()
                     if rl is not None:
                         t["rl"] = rl.snapshot()
+                    if explore is not None:
+                        t["explore"] = explore.snapshot()
                     await ws.send_str(json.dumps(t))
                     if n % 2 == 0:  # 5Hz
                         lf = bridge.lidar_frame()
@@ -737,6 +816,10 @@ def build_app(bridge: RobotBridge, transcriber: Transcriber = None,
                         hf = bridge.heightmap_frame()
                         if hf:
                             await ws.send_bytes(hf)
+                    if n % 10 == 0 and explore is not None:  # 1Hz
+                        mf = explore.map_frame()
+                        if mf:
+                            await ws.send_bytes(mf)
                 except (ConnectionResetError, RuntimeError):
                     break
                 n += 1
@@ -753,10 +836,23 @@ def build_app(bridge: RobotBridge, transcriber: Transcriber = None,
                     continue
                 t = d.get("type")
                 if t == "cmd":
-                    bridge.set_cmd(d.get("vx", 0), d.get("vy", 0), d.get("wz", 0))
+                    try:
+                        cmd = (float(d.get("vx", 0)), float(d.get("vy", 0)),
+                               float(d.get("wz", 0)))
+                    except (TypeError, ValueError):
+                        cmd = (float("nan"), 0.0, 0.0)
+                    if not all(math.isfinite(v) for v in cmd):
+                        abort_autonomy("invalid manual command")
+                        bridge.set_cmd(0, 0, 0)
+                        continue
+                    if any(abs(v) > 1e-9 for v in cmd):
+                        # 手動入力は明示的override。自律keeperとのlast-write-winsを
+                        # 許さず、全世代を失効・zero化してから手動commandを適用。
+                        abort_autonomy("manual override")
+                    bridge.set_cmd(*cmd)
                 elif t == "arm":
                     on = d.get("on", False)
-                    if not on:
+                    if not isinstance(on, bool) or not on:
                         abort_autonomy("DISARM")
                     bridge.set_armed(on)
                     await ws.send_str(json.dumps({"type": "ack", "what": "arm",
@@ -769,8 +865,25 @@ def build_app(bridge: RobotBridge, transcriber: Transcriber = None,
                     await ws.send_str(json.dumps({"type": "ack", "what": name,
                                                   "result": r}))
                 elif t == "mission":
-                    err = mission.start(d.get("instruction", "")) if mission else "無効です"
-                    await ws.send_str(json.dumps({"type": "ack", "what": "mission",
+                    instruction = d.get("instruction", "")
+                    if mission is None:
+                        err = "無効です"
+                        what = "mission"
+                    elif (classify_exploration_request(instruction) is not None
+                          and explore is not None):
+                        # AI MISSION欄からの探索も同じproposal/confirm経路へ統一。
+                        err = explore.route_text(instruction, modality="ui")
+                        what = "explore"
+                    elif stair_busy():
+                        err = "段差タスクの実行中です(先に停止してください)"
+                        what = "mission"
+                    elif rl is not None and rl.is_running():
+                        err = "RL方策の実行中です(先に停止してください)"
+                        what = "mission"
+                    else:
+                        err = mission.start(instruction)
+                        what = "mission"
+                    await ws.send_str(json.dumps({"type": "ack", "what": what,
                                                   "result": err or "ok"}))
                 elif t == "mission_stop":
                     if mission is not None:
@@ -780,6 +893,8 @@ def build_app(bridge: RobotBridge, transcriber: Transcriber = None,
                 elif t == "stair_start":
                     if stair is None:
                         err = "無効です"
+                    elif mission is not None and mission.status == "running":
+                        err = "自律探索の実行中です(先に探索を停止してください)"
                     else:
                         if mission is not None:
                             mission.abort("stair task開始")  # 自律系の二重実行を防ぐ
@@ -799,6 +914,9 @@ def build_app(bridge: RobotBridge, transcriber: Transcriber = None,
                 elif t == "rl_start":   # 手動でRL方策だけ起動(登坂タスクを介さない)
                     if rl is None:
                         err = "RLバックエンドが無効です"
+                    elif mission is not None and mission.status == "running":
+                        # 探索(自動登坂含む)と RL 方策の二重駆動を防ぐ
+                        err = "自律探索の実行中です(先に探索を停止してください)"
                     else:
                         if mission is not None:
                             mission.abort("RL開始")
@@ -819,6 +937,43 @@ def build_app(bridge: RobotBridge, transcriber: Transcriber = None,
                     err = rl.restore_sport() if rl is not None else "無効です"
                     await ws.send_str(json.dumps({"type": "ack", "what": "rl_restore",
                                                   "result": err or "ok"}))
+                elif t == "explore":     # 自然言語テキスト → 契約パーサ → 提案
+                    if explore is None:
+                        r = {"kind": "error", "say": "探索機能が無効です"}
+                    else:
+                        r = explore.route_text(d.get("text", ""), modality="text")
+                        if not r.get("handled"):
+                            r = {"kind": "non_command",
+                                 "say": "命令として解釈できませんでした(探索/移動/停止の指示のみ)"}
+                    await ws.send_str(json.dumps({"type": "ack", "what": "explore",
+                                                  "result": r}))
+                elif t == "explore_auto":  # 🤖 自律モードボタン(確認は別途必要)
+                    if explore is None:
+                        r = {"kind": "error", "say": "探索機能が無効です"}
+                    else:
+                        r = explore.route_text("部屋を探索してマップを作って",
+                                               modality="ui")
+                    await ws.send_str(json.dumps({"type": "ack",
+                                                  "what": "explore_auto",
+                                                  "result": r}))
+                elif t == "explore_confirm":
+                    r = (explore.confirm() if explore is not None
+                         else {"kind": "error", "say": "無効です"})
+                    await ws.send_str(json.dumps({"type": "ack",
+                                                  "what": "explore_confirm",
+                                                  "result": r}))
+                elif t == "explore_cancel":
+                    r = (explore.cancel_proposal("user")
+                         if explore is not None else {"kind": "error"})
+                    await ws.send_str(json.dumps({"type": "ack",
+                                                  "what": "explore_cancel",
+                                                  "result": r}))
+                elif t == "explore_stop":
+                    if explore is not None:
+                        explore.abort("user")
+                    await ws.send_str(json.dumps({"type": "ack",
+                                                  "what": "explore_stop",
+                                                  "result": "ok"}))
         finally:
             task.cancel()
             # クライアント切断=操縦者喪失 → 自律系を止めて停止(安全)
@@ -873,9 +1028,21 @@ def main():
     mission = MissionAgent(bridge, model=args.vlm_model or DEFAULT_MODEL)
     rl = RlController(bridge)
     stair = StairTask(bridge, vlm_model=args.vlm_model or DEFAULT_MODEL, rl=rl)
+    explore = ExploreTask(bridge, stair_task=stair, mission=mission)
+    # 自律系の相互排他: AI任務/段差タスクの実行中は探索開始を拒否
+    # (stair_task の属性は state。"status" ではない — 2026-07-18 修正)
+    _STAIR_BUSY = ("starting", "scan", "align", "approach", "confirm",
+                   "climb", "settle", "handoff")
+    explore.external_busy = lambda: (
+        "AI任務の実行中です(先に停止してください)"
+        if mission.status == "running" else
+        "段差タスクの実行中です(先に停止してください)"
+        if getattr(stair, "state", "idle") in _STAIR_BUSY else
+        "RL方策の実行中です(先に停止してください)"
+        if rl is not None and rl.is_running() else None)
     deploy_log("cockpit_start", mock=args.mock, port=args.port)
     from aiohttp import web
-    app = build_app(bridge, transcriber, mission, stair, rl)
+    app = build_app(bridge, transcriber, mission, stair, rl, explore)
     print("=" * 60)
     print(" Go2 COCKPIT  →  http://localhost:%d  (mock=%s)" % (args.port, args.mock))
     print("   起動直後はDISARM。UIのARMスイッチONで操縦可能になります。")

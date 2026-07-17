@@ -3,19 +3,24 @@
 hardware / Claude CLI / background thread を起動せず、探索分類、LiDAR/odom
 freshness、frame gate、keeper の最終停止判定を固定する。
 """
+import threading
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import numpy as np
 
+from common import config
 from cockpit.mission import (
     AUTONOMY_SENSOR_MAX_AGE_S,
     MissionAgent,
+    autonomy_robot_state_error,
     autonomy_sensor_error,
     classify_exploration_request,
 )
 from cockpit.server import RobotBridge
+from navigation.exploration_controller import ControlStatus
 
 
 NOW = 1_000.0
@@ -41,6 +46,11 @@ class FakeBridge:
         )
         self.stair = {"kind": "none"}
         self.commands = []
+        self.robot_state = {
+            "low_age": 0.01,
+            "rpy": [0.0, 0.0, 0.0],
+        }
+        self.bot = SimpleNamespace(state=lambda: dict(self.robot_state))
 
     def set_cmd(self, vx, vy, wz):
         self.commands.append((float(vx), float(vy), float(wz)))
@@ -138,6 +148,123 @@ class AutonomySensorContractTest(unittest.TestCase):
                 self.assertIn("frame", autonomy_sensor_error(bridge, now_s=NOW))
 
 
+class AutonomyRobotStateContractTest(unittest.TestCase):
+    def test_fresh_level_real_state_passes(self):
+        self.assertIsNone(autonomy_robot_state_error(FakeBridge()))
+
+    def test_real_lowstate_and_attitude_fail_closed(self):
+        cases = (
+            ({"low_age": 0.51}, "lowstate"),
+            ({"low_age": float("nan")}, "lowstate"),
+            ({"rpy": None}, "roll/pitch"),
+            ({"rpy": [0.51, 0.0, 0.0]}, "roll"),
+            ({"rpy": [0.0, -0.71, 0.0]}, "pitch"),
+            ({"rpy": [float("nan"), 0.0, 0.0]}, "不正"),
+        )
+        for changes, expected in cases:
+            with self.subTest(changes=changes):
+                bridge = FakeBridge()
+                bridge.robot_state.update(changes)
+                self.assertIn(expected, autonomy_robot_state_error(bridge))
+
+    def test_robot_state_exception_fails_closed(self):
+        bridge = FakeBridge()
+        bridge.bot = SimpleNamespace(
+            state=Mock(side_effect=RuntimeError("synthetic state failure")))
+        self.assertIn("取得失敗", autonomy_robot_state_error(bridge))
+
+
+class MissionStartContractTest(unittest.TestCase):
+    def _accepted_exploration(self):
+        from tests.test_mission_executive import CTX, make_exec, make_spec
+        spec = make_spec()
+        executive = make_exec()
+        self.assertTrue(executive.accept_goal(spec, CTX, 2_000).accepted)
+        return spec, executive
+
+    def test_direct_language_cannot_bypass_exploration_confirmation(self):
+        agent = MissionAgent(FakeBridge())
+
+        error = agent.start("部屋を探索してマップを作って")
+
+        self.assertIn("確認", error)
+        self.assertFalse(agent._run_flag)
+
+    def test_only_fsm_accepted_goal_reaches_safe_runner(self):
+        agent = MissionAgent(FakeBridge())
+        spec, executive = self._accepted_exploration()
+        agent._launch_locked = Mock(return_value=None)
+
+        with patch("cockpit.mission.time.monotonic", return_value=NOW):
+            error = agent.start_goal(spec, executive)
+
+        self.assertIsNone(error)
+        agent._launch_locked.assert_called_once_with(
+            spec.transcript.text, "explore", spec.target.ref, spec)
+
+    def test_missing_fsm_or_stale_scan_is_rejected(self):
+        spec, executive = self._accepted_exploration()
+        agent = MissionAgent(FakeBridge())
+        self.assertIn("FSM", agent.start_goal(spec, None))
+        agent.bridge.cloud_ts = NOW - AUTONOMY_SENSOR_MAX_AGE_S - 0.01
+        with patch("cockpit.mission.time.monotonic", return_value=NOW):
+            error = agent.start_goal(spec, executive)
+        self.assertIn("stale", error)
+
+
+class MissionRunGenerationTest(unittest.TestCase):
+    def test_abort_during_planner_step_cannot_be_overwritten_by_old_run(self):
+        entered = threading.Event()
+        release = threading.Event()
+
+        class BlockingController:
+            def __init__(self, gmap, *_args, **_kwargs):
+                self.gmap = gmap
+
+            def integrate_point_cloud(self, *_args, **_kwargs):
+                return 1
+
+            def step(self, *_args, **_kwargs):
+                entered.set()
+                release.wait(2.0)
+                return SimpleNamespace(
+                    status=ControlStatus.COMPLETE,
+                    vx=0.0, vy=0.0, wz=0.0,
+                    reason="synthetic complete", goal=None,
+                    map_revision=self.gmap.revision,
+                )
+
+            def metrics(self):
+                return {}
+
+        now = time.monotonic()
+        bridge = FakeBridge(now=now, mock=True)
+        agent = MissionAgent(bridge)
+        agent._run_flag = True
+        agent._run_id = 9
+        agent.status = "running"
+        agent.mode = "explore"
+        agent.exploration_target = "current_room"
+        agent.t0 = now
+
+        with patch("cockpit.mission.ExplorationController", BlockingController), \
+                patch("cockpit.mission.deploy_log"):
+            worker = threading.Thread(target=agent._run_exploration, args=(9,))
+            worker.start()
+            self.assertTrue(entered.wait(2.0))
+            agent.abort("synthetic STOP", expected_run_id=9)
+            release.set()
+            worker.join(2.0)
+
+        self.assertFalse(worker.is_alive())
+        self.assertFalse(agent._run_flag)
+        self.assertEqual(agent.status, "aborted")
+        self.assertEqual(agent.detail, "中断: synthetic STOP")
+        self.assertEqual(agent._cur, (0.0, 0.0, 0.0))
+        self.assertTrue(bridge.commands)
+        self.assertEqual(bridge.commands[-1], (0.0, 0.0, 0.0))
+
+
 class ServerFrameGateTest(unittest.TestCase):
     def test_only_odom_frame_contract_is_accepted(self):
         self.assertTrue(RobotBridge._is_world_cloud_frame("odom"))
@@ -161,6 +288,42 @@ class ServerFrameGateTest(unittest.TestCase):
         self.assertEqual(bridge.pose_src, "lidar_odom")
         self.assertEqual(bridge.pose_ts, NOW)
         self.assertEqual(bridge.pose, (1.0, 2.0, 0.31, 0.0))
+
+
+class ServerCommandValidationTest(unittest.TestCase):
+    @staticmethod
+    def make_bridge():
+        bridge = RobotBridge.__new__(RobotBridge)
+        bridge._lock = threading.Lock()
+        bridge.cmd = [0.0, 0.0, 0.0]
+        bridge.cmd_ts = 0.0
+        bridge.armed = False
+        bridge.bot = SimpleNamespace(stop_move=Mock())
+        return bridge
+
+    def test_nonfinite_or_unparseable_command_becomes_immediate_zero(self):
+        for value in (float("nan"), float("inf"), "not-a-number"):
+            with self.subTest(value=value):
+                bridge = self.make_bridge()
+                with patch("cockpit.server.deploy_log"):
+                    accepted = bridge.set_cmd(value, 0.0, 0.0)
+                self.assertFalse(accepted)
+                self.assertEqual(bridge.cmd, [0.0, 0.0, 0.0])
+                bridge.bot.stop_move.assert_called_once_with()
+
+    def test_finite_command_is_clamped_and_invalid_arm_cannot_arm(self):
+        bridge = self.make_bridge()
+        with patch("cockpit.server.deploy_log"):
+            self.assertTrue(bridge.set_cmd(99.0, -99.0, 99.0))
+        self.assertEqual(bridge.cmd, [
+            config.VEL_LIMIT["vx"][1],
+            config.VEL_LIMIT["vy"][0],
+            config.VEL_LIMIT["wz"][1],
+        ])
+        with patch("cockpit.server.deploy_log"):
+            self.assertFalse(bridge.set_armed("true"))
+        self.assertFalse(bridge.armed)
+        self.assertEqual(bridge.cmd, [0.0, 0.0, 0.0])
 
 
 class _SafeGuard:
@@ -200,14 +363,14 @@ class MissionKeeperSafetyTest(unittest.TestCase):
         return agent
 
     @staticmethod
-    def run_one_keeper_tick(agent):
+    def run_one_keeper_tick(agent, run_id=None):
         def stop_after_tick(_seconds):
             agent._run_flag = False
 
         with patch("cockpit.mission.time.monotonic", return_value=NOW), \
                 patch("cockpit.mission.time.sleep", side_effect=stop_after_tick), \
                 patch("cockpit.mission.deploy_log"):
-            agent._keeper()
+            agent._keeper(run_id=run_id)
 
     def test_safe_assessed_command_is_forwarded(self):
         bridge = FakeBridge()
@@ -225,6 +388,33 @@ class MissionKeeperSafetyTest(unittest.TestCase):
         self.assertEqual(bridge.commands, [(0.0, 0.0, 0.0)])
         self.assertEqual(agent._cur, (0.0, 0.0, 0.0))
         self.assertFalse(agent.safety["safe"])
+        guard.assess.assert_not_called()
+
+    def test_stale_lowstate_forces_zero_without_calling_guard(self):
+        bridge = FakeBridge()
+        bridge.robot_state["low_age"] = 0.51
+        guard = Mock()
+        agent = self.make_agent(bridge, guard)
+        self.run_one_keeper_tick(agent)
+        self.assertEqual(bridge.commands, [(0.0, 0.0, 0.0)])
+        self.assertFalse(agent.safety["safe"])
+        self.assertIn("lowstate", agent.safety["reason"])
+        guard.assess.assert_not_called()
+
+    def test_stale_lowstate_invalidates_live_run_without_auto_resume(self):
+        bridge = FakeBridge()
+        bridge.robot_state["low_age"] = 0.51
+        guard = Mock()
+        agent = self.make_agent(bridge, guard)
+        agent._run_id = 7
+        agent._lifecycle_lock = threading.RLock()
+
+        self.run_one_keeper_tick(agent, run_id=7)
+
+        self.assertFalse(agent._run_flag)
+        self.assertEqual(agent.status, "aborted")
+        self.assertIn("機体状態異常", agent.detail)
+        self.assertEqual(bridge.commands, [(0.0, 0.0, 0.0)])
         guard.assess.assert_not_called()
 
     def test_guard_rejection_forces_zero(self):

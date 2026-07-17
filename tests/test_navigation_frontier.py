@@ -196,6 +196,59 @@ class TestReachabilityAndHistory(unittest.TestCase):
         self.assertGreater(separation, 0.5)
         self.assertEqual(explorer.goal_attempts[failed_cell], 1)
 
+    def test_failed_far_frontier_does_not_reissue_same_truncated_goal(self):
+        """遠いfrontierでも履歴は最終viewpointでなく実際の中間goalへ効く。"""
+        m = GlobalOccupancyMap(size_m=(20.0, 20.0), resolution_m=0.1,
+                               origin_xy=(0.0, 0.0), map_id="far_frontier")
+        m.grid[20:180, 20:180] = FREE
+        robot_xy = m.cell_to_world(100, 100)
+        explorer = FrontierExplorer(
+            m, inflate_cells=0, max_step_m=1.0, standoff_m=0.1,
+            min_progress_m=0.1, failure_cooldown_plans=8)
+
+        first = explorer.plan(robot_xy)
+        self.assertIs(first.status, ExplorationStatus.GOAL, first.reason)
+        self.assertAlmostEqual(first.goal.path_length_m, 1.0)
+        failed_cell = first.goal.goal_cell
+        explorer.goal_failed()
+
+        second = explorer.plan(robot_xy)
+
+        self.assertIs(second.status, ExplorationStatus.GOAL, second.reason)
+        self.assertNotEqual(second.goal.goal_cell, failed_cell)
+        separation = math.hypot(second.goal.goal_cell[0] - failed_cell[0],
+                                second.goal.goal_cell[1] - failed_cell[1]) \
+            * m.resolution_m
+        self.assertGreater(separation, 0.5)
+
+
+class TestLegacyOptionsRemainFailClosed(unittest.TestCase):
+    def test_optimistic_flag_does_not_cross_unknown_gap(self):
+        m = make_map()
+        bx, by = m.world_to_cell(0.0, 0.0)
+        m.grid[by - 2:by + 3, bx - 2:bx + 3] = FREE
+        m.grid[by - 3:by + 4, bx + 15:bx + 24] = FREE
+
+        conservative = next_goal(m, (0.0, 0.0), inflate_cells=0)
+        legacy = next_goal(m, (0.0, 0.0), inflate_cells=0,
+                           optimistic=True)
+
+        self.assertEqual(legacy, conservative)
+        if legacy.status is ExplorationStatus.GOAL:
+            cells = [m.world_to_cell(*p) for p in legacy.goal.path]
+            self.assertTrue(all(m.grid[y, x] == FREE for x, y in cells))
+
+    def test_minimum_goal_distance_never_pushes_into_unknown(self):
+        m = make_map()
+        bx, by = m.world_to_cell(0.0, 0.0)
+        m.grid[by - 1:by + 2, bx - 1:bx + 2] = FREE
+
+        decision = next_goal(m, (0.0, 0.0), inflate_cells=0,
+                             optimistic=True, min_goal_dist_m=0.5)
+
+        self.assertIs(decision.status, ExplorationStatus.NO_REACHABLE_FRONTIER)
+        self.assertIsNone(decision.goal)
+
 
 if __name__ == "__main__":
     unittest.main()
