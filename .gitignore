@@ -22,6 +22,7 @@ check_frame.jpg
 *.mp4
 *.webm
 *.wav
+artifacts/maps/
 
 # Local scratch and generated intermediates
 tmp/

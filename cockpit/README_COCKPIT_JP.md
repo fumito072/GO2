@@ -105,6 +105,32 @@ ping 192.168.123.161        # 通らなければDDSも通らない
 オプション: `--vlm-model haiku|sonnet|opus`(既定haiku=最速。認識精度を上げたい時はsonnet)。
 音声で長い指示を話すと(単純コマンドに該当しない場合)自動で入力欄に転記される。
 
+## 🗺 自律探索マッピング (音声/自然言語 → 契約パーサ → EXPLORE MAP パネル)
+
+VLM を使わない**決定的**な自然言語/音声経路(docs/12)。エッジ機単体で完結する。
+
+- 入口は2つ、意味論は同一: EXPLORE MAP パネルのテキスト入力 / 🎤PTT音声。
+  どちらも `voice_gateway.intent_parser`(限定文法)で解釈される。
+  例: 「部屋を探索してマップを作って」「全部探索して」「ホームに戻って」。
+- **移動を伴う指示は必ず復唱確認**(パネルの「✓確認」または音声「はい」)。
+  確認期限30秒。**「止まれ」は確認なし・ARM不問で即時停止**(自動再開なし。
+  再開には新しい指示+確認が必要)。命令でない発話は従来のテレオペ解釈へ落ちる。
+- 実行経路は `GoalSpec → Mission FSM → Command Arbiter → Actuation Gateway →
+  Sport Move` の一方向(docs/02 invariant 2)。探索は frontier 方式で、
+  LiDAR点群を z帯分類(床=FREE ray/障害=OCCUPIED/落差=hazard)して
+  2D占有格子(0.05m, odom系)を構築する。unknown≠free、点群/pose途絶は
+  fail-closed で停止。速度は vx≤0.25 / |wz|≤0.5 に固定クランプ。
+- frontier 枯渇で `EXPLORATION_COMPLETE` → 立位保持(ACTIVE_HOLD)。地図は
+  `artifacts/maps/cockpit_explore/map.json` に保存され、`home` waypoint が
+  登録される(「ホームに戻って」で使用)。地図が25秒成長しない場合は
+  「打ち切り」として完了と区別して停止する。
+- 中断経路: DISARM / 停止 / DAMP / Space / WS切断 / roll・pitch超過 /
+  lowstate・pose・点群途絶 / タイムアウト600s — いずれも Controlled Stop。
+- Mockモードで全機能を試せる(背面壁で閉じた合成部屋を探索し完了まで到達する)。
+
+> 実機での初回は docs/12 §8 を必読: Gate 3 相当の停止確認(各停止経路で1s以内
+> 静止)を先に行い、狭い既知区画・人の立入なしで開始すること。
+
 ## 🪜 段差登坂タスク (LiDAR + カメラ → 自律登坂)
 
 ハイトマップ下のバーに検出結果が常時表示される(5Hz更新)。緑=登坂可能、赤=危険。
