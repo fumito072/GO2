@@ -50,6 +50,13 @@ _NO_STOP_RE = re.compile(r"(止|と)まら(ず|ない)|(止|と)まるな")
 _PROHIBIT_RE = re.compile(
     r"(登らな|上らな|のぼらな|下りな|降りな|おりな|行かな|進まな|来な)"
     r"|(登|上|のぼ|下り|降り)るな")
+# 探索/地図作成の禁止形。skill検出より先に拒否しないと、例えば
+# 「探索しないで」の先頭語だけがEXPLORE_AND_MAPへ昇格してしまう。
+_PROHIBIT_EXPLORE_RE = re.compile(
+    r"(探索|探検|見回)(は|を)?(し)?(ない|なく|ません|るな)"
+    r"|見(て)?回ら(ない|なく)|マッピングし(ない|なく|ません)"
+    r"|(マップ|地図)を?(作ら|構築し|生成し)(ない|なく|ません)"
+    r"|(探索|探検|見回|マッピング).*(やめ|不要|禁止|キャンセル)")
 
 _ASCEND_RE = re.compile(r"(登|上|のぼ)(っ|れ|る|り)")
 # ひらがな「おり」は「とおりに」等に誤一致するため活用語尾を必須にする
@@ -201,6 +208,9 @@ def parse_utterance(text: str, ctx: ParserContext) -> ParseResult:
         return ParseResult(ParseKind.NON_COMMAND, "否定された stop は命令ではない")
     if _PROHIBIT_RE.search(t):
         return ParseResult(ParseKind.NON_COMMAND, "禁止形は task ではない(記録のみ)")
+    if _PROHIBIT_EXPLORE_RE.search(t):
+        return ParseResult(ParseKind.NON_COMMAND,
+                           "探索/地図作成の禁止形は task ではない(記録のみ)")
 
     # --- skill 検出(stop 判定より先に必要 — 単独 stop かどうかを決めるため) ---
     has_ascend = _ASCEND_RE.search(t) is not None

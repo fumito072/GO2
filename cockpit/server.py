@@ -64,6 +64,7 @@ class RobotBridge:
         self.elev = RollingElevationMap(size_m=8.0, res=0.05)
         self.pose = None          # (x,y,z,yaw) odom系
         self.pose_src = "none"
+        self.pose_ts = 0.0        # robot_odom callback受信 monotonic時刻
         self.cloud_pts = None     # 直近点群 (N,3) odom系
         self.cloud_ts = 0.0
         self.cloud_rx_ts = 0.0
@@ -182,6 +183,7 @@ class RobotBridge:
         q = msg.pose.pose.orientation
         self.pose = (p.x, p.y, p.z, quat_to_yaw(q.w, q.x, q.y, q.z))
         self.pose_src = "lidar_odom"
+        self.pose_ts = time.monotonic()
         self._update_vel(p.x, p.y, p.z)
 
     def _filter_cloud(self, pts, *, radius_m, z_below_m, z_above_m):
@@ -219,7 +221,9 @@ class RobotBridge:
     def _is_world_cloud_frame(frame):
         """robot_odom poseと同じodom frameか。map等は変換がないため許可しない。"""
         name = str(frame or "").strip("/\x00").lower()
-        return name == "odom" or name.startswith("odom/") or name.endswith("/odom")
+        # prefix/suffix許可は fake/odom, map/odom, odom/lidar まで誤受理する。
+        # 実機で確認済みの cloud_deskewed 契約は frame_id=odom の完全一致。
+        return name == "odom"
 
     def _warn_cloud(self, message):
         """LiDAR callbackを止めず、同じ警告は最大2秒に1回だけ出す。"""
@@ -271,22 +275,19 @@ class RobotBridge:
             self._warn_cloud("finiteなXYZ点が0件です (frame=%s)" % self.cloud_frame)
             return
 
-        # lidar_odomが未着なら従来どおりSportModeStateを試す。ただしpose無しの
-        # scanを無制限でworldへ蓄積しない（-14m級外れ値が永久に残るため）。
-        if self.pose_src != "lidar_odom":
-            st = self.bot.state()
-            if "pos" in st:
-                q = st.get("quat", [1, 0, 0, 0])
-                self.pose = (st["pos"][0], st["pos"][1], st["pos"][2],
-                             quat_to_yaw(q[0], q[1], q[2], q[3]))
-                self.pose_src = "sms"
-                self._update_vel(*self.pose[:3])
-        if self.pose is None:
+        # odom cloudとSportModeState poseは原点/時刻の同一性が保証されない。
+        # robot_odomがfreshでないscanをworld mapへ混ぜずfail-closedにする。
+        pose_age = time.monotonic() - float(getattr(self, "pose_ts", 0.0) or 0.0)
+        if self.pose is None or self.pose_src != "lidar_odom" \
+                or pose_age < 0 or pose_age > 0.6:
             self.cloud_ui_n = 0
             self.cloud_elev_n = 0
             self.cloud_scan_valid = False
             self.cloud_bounds = None
-            self._warn_cloud("pose未受信のためscanを保留しました (frame=%s)" % self.cloud_frame)
+            self._warn_cloud(
+                "freshなrobot_odom poseがないためscanを破棄しました "
+                "(frame=%s pose_src=%s age=%.3fs)" %
+                (self.cloud_frame, self.pose_src, pose_age))
             return
 
         ui_pts = self._filter_cloud_ui(raw_pts)
@@ -417,6 +418,7 @@ class RobotBridge:
             base_z = float(self._mock_ground(x)) + 0.31
             self.pose = (x, y, base_z, yaw)
             self.pose_src = "mock"
+            self.pose_ts = time.monotonic()
             self._update_vel(x, y, base_z)
             near_ui = ((scene_pts[:, 0] - x) ** 2 + (scene_pts[:, 1] - y) ** 2
                        < self.UI_CLOUD_RADIUS_M ** 2)
@@ -565,6 +567,7 @@ class RobotBridge:
              "cmd": [round(v, 2) for v in self.cmd],
              "low_age_ms": round(st.get("low_age", 1e9) * 1e3, 1),
              "pose_src": self.pose_src,
+             "pose_age": round(now - self.pose_ts, 3) if self.pose_ts else None,
              "cloud_hz": round(self.cloud_hz, 1),
              "cloud_age": round(now - self.cloud_ts, 2) if self.cloud_ts else None,
              "cloud_rx_age": round(now - self.cloud_rx_ts, 2) if self.cloud_rx_ts else None,

@@ -7,30 +7,96 @@
 安全:
   - ミッション開始は ARMED 時のみ。DISARM/停止/DAMP/「止まって」で即中断。
   - 速度は vx≤0.3, |wz|≤0.6 にクランプ(通常テレオペよりさらに保守的)。
-  - 1判断の実行は最大 HOLD_S 秒 — 次の判断が来なければ自動停止(VLM停止対策)。
+  - VLMの1判断は最大0.8秒だけ実行し、全commandをLiDAR guardianが10Hzで再検査。
+  - EXPLORE_AND_MAPはVLM open-loopではなくglobal map + A* frontier探索を使う。
   - ミッション全体のタイムアウト(既定180s)。全判断を deploy_log に記録。
 """
 import json
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import threading
 import time
+import uuid
 from collections import deque
+from dataclasses import dataclass
+from datetime import datetime, timezone
 
 import numpy as np
 
 from common import config
 from common.safety import deploy_log
+from contracts.goal_spec import Intent, Modality
+from navigation.collision_guard import CollisionGuard
+from navigation.exploration_controller import (
+    ControlStatus, ExplorationController, ExplorationControllerConfig,
+)
+from perception.global_map import GlobalOccupancyMap
+from voice_gateway.intent_parser import ParseKind, ParserContext, parse_utterance
 
 DEFAULT_MODEL = "claude-sonnet-5"
 VX_MAX = 0.3
 WZ_MAX = 0.6
-HOLD_MOVE_S = 8.0    # 1判断あたりの最大実行時間(次の判断がこれより遅れたら停止)
-HOLD_TURN_S = 4.0
+# VLM判断間のopen-loop距離を制限する。旧値8秒では0.3m/s時に2.4m進み、
+# 次の画像/LiDAR判断より先に衝突できた。探索は下の10Hz controllerを使う。
+HOLD_MOVE_S = 0.8
+HOLD_TURN_S = 0.8
 MISSION_TIMEOUT_S = 180.0
 VLM_TIMEOUT_S = 90.0  # sonnetは画像2枚Readで30〜60秒かかることがある
+AUTONOMY_SENSOR_MAX_AGE_S = 0.60
+AUTONOMY_SENSOR_ABORT_S = 2.0
+EXPLORATION_LOOP_S = 0.10
+
+
+@dataclass(frozen=True)
+class AutonomySensorSnapshot:
+    """1回の安全判定で共有するpose/cloudの読み取りsnapshot。"""
+    mock: bool
+    pose: object
+    pose_src: str
+    pose_ts: float
+    cloud_frame: str
+    cloud_ts: float
+    cloud_scan_valid: bool
+    cloud_pts: object
+    hazard: object
+    coherent: bool = True
+
+
+def capture_autonomy_sensors(bridge) -> AutonomySensorSnapshot:
+    """callback更新と競合しない同一世代のsensor fieldsを取得する。
+
+    RobotBridgeはtuple/array参照を丸ごと差し替えるため、pose/cloud timestampを
+    前後で読むseqlock方式で混在を検出できる。3回競合した場合はfail-closed。
+    """
+    last = None
+    for _ in range(3):
+        pose_ts_before = float(getattr(bridge, "pose_ts", 0.0) or 0.0)
+        cloud_ts_before = float(getattr(bridge, "cloud_ts", 0.0) or 0.0)
+        hazard = getattr(bridge, "stair", None)
+        if isinstance(hazard, dict):
+            hazard = dict(hazard)
+        last = AutonomySensorSnapshot(
+            mock=bool(getattr(bridge, "mock", False)),
+            pose=getattr(bridge, "pose", None),
+            pose_src=str(getattr(bridge, "pose_src", "none")),
+            pose_ts=pose_ts_before,
+            cloud_frame=str(getattr(bridge, "cloud_frame", "") or ""),
+            cloud_ts=cloud_ts_before,
+            cloud_scan_valid=bool(getattr(bridge, "cloud_scan_valid", False)),
+            cloud_pts=getattr(bridge, "cloud_pts", None),
+            hazard=hazard,
+            coherent=True,
+        )
+        if (pose_ts_before == float(getattr(bridge, "pose_ts", 0.0) or 0.0)
+                and cloud_ts_before ==
+                float(getattr(bridge, "cloud_ts", 0.0) or 0.0)):
+            return last
+    return AutonomySensorSnapshot(**{
+        **last.__dict__, "coherent": False,
+    })
 
 SYSTEM_PROMPT = """あなたは四足ロボット Unitree Go2 の遠隔操縦支援モジュールです。
 
@@ -41,7 +107,8 @@ SYSTEM_PROMPT = """あなたは四足ロボット Unitree Go2 の遠隔操縦支
 - 毎ターン渡される画像は、その瞬間の実カメラ映像とLiDAR標高マップの最新フレームである
   (前ターンとは別の新しい画像。ファイル名の連番が進む)。
 - 操縦者が停止ボタン/Space/「止まって」/ARM解除のいずれかを行えば即座に中断される。
-  あなたの判断が届かない間も、ロボットは最大8秒で自動停止する(暴走防止)。
+  あなたの判断が届かない間も、ロボットは最大0.8秒で自動停止し、
+  LiDAR安全監視が10Hzで各コマンドを再検査する。
 - 危険と判断したら "stop" を返すのがあなたの役割であり、常に尊重される。
 
 ## 各ターンの手順
@@ -84,6 +151,91 @@ def _extract_json(text):
     except (TypeError, ValueError):
         d["vx"], d["wz"] = 0.0, 0.0
     return d
+
+
+def classify_exploration_request(text: str):
+    """限定grammarでEXPLORE_AND_MAPだけを識別し、target refを返す。
+
+    UIのEXECUTE clickを確認操作とみなすが、質問・否定・曖昧文を近似解釈して
+    探索開始しない。該当しなければNone。
+    """
+    if not isinstance(text, str) or not text.strip():
+        return None
+    normalized = re.sub(r"\s+", "", text).lower()
+    exploration_words = ("探索", "探検", "見回", "マッピング", "map", "マップ", "地図")
+    negative_words = (
+        "しない", "しなく", "しません", "するな", "しないで", "作らない",
+        "作らなく", "やめ", "止め", "不要", "禁止", "キャンセル",
+        "don't", "don’t", "donot", "not",
+    )
+    question_patterns = (
+        r"[?？]$", r"できますか$", r"してくれますか$", r"しますか$",
+        r"でしょうか$", r"ですか$", r"かな$",
+    )
+    # 下位parserが将来grammarを広げても、否定・質問を自律開始へ昇格させない。
+    if any(word in normalized for word in exploration_words):
+        if any(word in normalized for word in negative_words):
+            return None
+        if any(re.search(pattern, normalized) for pattern in question_patterns):
+            return None
+    lease, session = str(uuid.uuid4()), str(uuid.uuid4())
+
+    def make_id():
+        return str(uuid.uuid4())
+
+    ctx = ParserContext(
+        modality=Modality.TEXT,
+        operator_lease_id=lease,
+        session_id=session,
+        utterance_id=None,
+        asr_model_id="cockpit-text-ui",
+        now_monotonic_ns=time.monotonic_ns(),
+        created_at_utc=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        id_factory=make_id,
+    )
+    result = parse_utterance(text, ctx)
+    if result.kind is ParseKind.PROPOSAL \
+            and result.proposal.intent is Intent.EXPLORE_AND_MAP:
+        return result.proposal.target.ref
+    return None
+
+
+def autonomy_sensor_error(bridge, now_s=None):
+    """自律運動に必要なLiDAR/odom契約をfail-closedで検査する。"""
+    now = time.monotonic() if now_s is None else float(now_s)
+    if not np.isfinite(now):
+        return "現在時刻が不正です"
+    sensor = (bridge if isinstance(bridge, AutonomySensorSnapshot)
+              else capture_autonomy_sensors(bridge))
+    if not sensor.coherent:
+        return "pose/LiDAR snapshotが更新中です"
+    pose = sensor.pose
+    try:
+        pose_values = np.asarray(pose[:4], dtype=np.float64)
+    except (TypeError, ValueError, IndexError):
+        pose_values = np.asarray([], dtype=np.float64)
+    if pose_values.shape != (4,) or not np.isfinite(pose_values).all():
+        return "odom poseがありません"
+    if not sensor.mock:
+        if sensor.pose_src != "lidar_odom":
+            return "pose sourceがlidar_odomではありません"
+        frame = sensor.cloud_frame.strip("/\x00").lower()
+        if frame != "odom":
+            return "LiDAR frameがodomではありません(%s)" % (frame or "missing")
+    pose_ts = sensor.pose_ts
+    if pose_ts <= 0 or now - pose_ts < 0 or now - pose_ts > AUTONOMY_SENSOR_MAX_AGE_S:
+        return "odom poseがstaleです"
+    if not sensor.cloud_scan_valid:
+        return "LiDAR scanがinvalidです"
+    cloud_ts = sensor.cloud_ts
+    if cloud_ts <= 0 or now - cloud_ts < 0 or now - cloud_ts > AUTONOMY_SENSOR_MAX_AGE_S:
+        return "LiDAR scanがstaleです"
+    pts = np.asarray(sensor.cloud_pts)
+    if pts.ndim != 2 or pts.shape[1] < 3 or len(pts) < 20:
+        return "LiDAR点密度が不足しています"
+    if int(np.count_nonzero(np.isfinite(pts[:, :3]).all(axis=1))) < 20:
+        return "finiteなLiDAR点が不足しています"
+    return None
 
 
 class ClaudeCliVLM:
@@ -218,8 +370,18 @@ class MissionAgent:
         self.history = deque(maxlen=20)
         self._cur = (0.0, 0.0, 0.0)
         self._hold_until = 0.0
+        self._command_lock = threading.Lock()
+        self._command_generation = 0
         self._run_flag = False
+        self._run_id = 0
         self._th = None
+        self.mode = "idle"        # idle|vlm|explore
+        self.exploration_target = None
+        self.gmap = None
+        self.controller = None
+        self.guard = CollisionGuard()
+        self.safety = {"safe": True, "reason": "hold"}
+        self._last_safety_log = None
         self.available = self._check_cli()
 
     @staticmethod
@@ -230,12 +392,12 @@ class MissionAgent:
     def snapshot(self):
         return {"status": self.status, "instruction": self.instruction,
                 "step": self.step, "last": self.last, "detail": self.detail,
-                "elapsed": round(time.monotonic() - self.t0, 1) if self._run_flag else 0}
+                "elapsed": round(time.monotonic() - self.t0, 1) if self._run_flag else 0,
+                "mode": self.mode, "safety": dict(self.safety),
+                "exploration": self.controller.metrics() if self.controller else None}
 
     # ---------- 開始/中断 ----------
     def start(self, instruction: str):
-        if not self.available:
-            return "claude CLIが見つかりません"
         if self._run_flag:
             return "ミッション実行中です(先に中断してください)"
         if not self.bridge.armed:
@@ -243,49 +405,266 @@ class MissionAgent:
         instruction = (instruction or "").strip()
         if not instruction:
             return "指示が空です"
+        target = classify_exploration_request(instruction)
+        if target is None and not self.available:
+            return "claude CLIが見つかりません"
+        sensor_error = autonomy_sensor_error(self.bridge)
+        if sensor_error:
+            return "自律走行を開始できません: " + sensor_error
         self.instruction = instruction
+        self.mode = "explore" if target is not None else "vlm"
+        self.exploration_target = target
+        self.gmap = None
+        self.controller = None
+        self.safety = {"safe": True, "reason": "preflight passed"}
         self.status = "running"
-        self.detail = "VLM起動中…"
+        self.detail = "探索controller起動中…" if target is not None else "VLM起動中…"
         self.step = 0
         self.last = {}
         self.t0 = time.monotonic()
         self._run_flag = True
-        self._th = threading.Thread(target=self._run, daemon=True)
+        self._run_id += 1
+        run_id = self._run_id
+        self._th = threading.Thread(target=self._run, args=(run_id,), daemon=True)
         self._th.start()
-        threading.Thread(target=self._keeper, daemon=True).start()
+        threading.Thread(target=self._keeper, args=(run_id,), daemon=True).start()
         deploy_log("mission_start", instruction=instruction, model=self.model)
         return None
 
-    def abort(self, why="user"):
+    def abort(self, why="user", expected_run_id=None):
         if not self._run_flag:
             return
+        if expected_run_id is not None and expected_run_id != self._run_id:
+            return
         self._run_flag = False
+        self._run_id += 1  # blocked旧threadが次missionへ復活しないよう失効
         self.status = "aborted"
         self.detail = "中断: " + why
-        self._cur = (0.0, 0.0, 0.0)
-        self.bridge.set_cmd(0, 0, 0)
+        self._stop_command()
         deploy_log("mission_abort", why=why)
 
     # ---------- 実行ループ ----------
-    def _keeper(self):
-        """判断間も速度を維持(HOLD上限まで)。cmd watchdog(0.5s)より速く打ち直す。"""
-        while self._run_flag:
-            if time.monotonic() < self._hold_until and any(self._cur):
-                self.bridge.set_cmd(*self._cur)
-            time.sleep(0.2)
+    def _run_is_active(self, run_id):
+        return self._run_flag and (run_id is None or run_id == self._run_id)
 
-    def _run(self):
+    def _ensure_command_sync(self):
+        """旧fixture/復元stateでも安全helperを利用できるよう初期化する。"""
+        if not hasattr(self, "_command_lock"):
+            self._command_lock = threading.Lock()
+        if not hasattr(self, "_command_generation"):
+            self._command_generation = 0
+
+    def _set_held_command(self, command, hold_s):
+        """keeperが検査するcommandを世代付きでatomicに公開する。"""
+        self._ensure_command_sync()
+        cmd = tuple(float(v) for v in command)
+        if len(cmd) != 3 or not np.isfinite(np.asarray(cmd)).all():
+            raise ValueError("command must be finite (vx,vy,wz)")
+        with self._command_lock:
+            self._cur = cmd
+            self._hold_until = time.monotonic() + max(0.0, float(hold_s))
+            self._command_generation += 1
+
+    def _stop_command(self):
+        """自律commandを無効化し、watchdogを待たず即座に0を送る。"""
+        self._ensure_command_sync()
+        # bridge送信まで同じlock内に置く。keeperの旧command送信が、このzeroを
+        # 後から追い越すTOCTOUを防ぐ。
+        with self._command_lock:
+            self._cur = (0.0, 0.0, 0.0)
+            self._hold_until = 0.0
+            self._command_generation += 1
+            self.bridge.set_cmd(0, 0, 0)
+
+    def _keeper(self, run_id=None):
+        """全自律commandをLiDAR guardianで検査してから再送する。"""
+        self._ensure_command_sync()
+        while self._run_is_active(run_id):
+            now = time.monotonic()
+            with self._command_lock:
+                command = tuple(self._cur)
+                deadline = self._hold_until
+                generation = self._command_generation
+            if now < deadline and any(command):
+                sensor = capture_autonomy_sensors(self.bridge)
+                err = autonomy_sensor_error(sensor, now)
+                assessment = None
+                if err is None:
+                    try:
+                        assessment = self.guard.assess(
+                            sensor.pose, sensor.cloud_pts, command,
+                            now_s=now,
+                            cloud_timestamp_s=sensor.cloud_ts,
+                            scan_valid=sensor.cloud_scan_valid,
+                            hazard=sensor.hazard)
+                        if not assessment.safe:
+                            err = assessment.reason
+                    except Exception as e:
+                        err = "collision guardian error: %r" % (e,)
+                if err:
+                    with self._command_lock:
+                        unchanged = generation == self._command_generation
+                    if unchanged:
+                        self._stop_command()
+                    self.safety = {"safe": False, "reason": err}
+                    if err != self._last_safety_log:
+                        deploy_log("mission_guard_stop", reason=err, mode=self.mode)
+                        self._last_safety_log = err
+                    self.detail = "安全停止: " + err
+                else:
+                    self.safety = {
+                        "safe": True,
+                        "reason": assessment.reason if assessment else "sensor ready",
+                        "clearance_m": assessment.clearance_m if assessment else None,
+                    }
+                    # 評価したsnapshotだけを送る。producerがhelper経由で新世代を
+                    # 公開した場合は、この旧評価を破棄して次tickで再検査する。
+                    with self._command_lock:
+                        if (generation == self._command_generation and
+                                self._run_is_active(run_id) and
+                                time.monotonic() < self._hold_until):
+                            self.bridge.set_cmd(*command)
+            elif any(command):
+                # refresh停止だけではbridge watchdogの0.5秒間、旧速度が残る。
+                with self._command_lock:
+                    unchanged = generation == self._command_generation
+                if unchanged:
+                    self._stop_command()
+            time.sleep(0.1)
+
+    def _run(self, run_id=None):
+        if self.mode == "explore":
+            self._run_exploration(run_id)
+        else:
+            self._run_vlm(run_id)
+
+    def _run_exploration(self, run_id=None):
+        """LiDAR global map + frontier/A* + guardianによる決定的な全域探索。"""
+        try:
+            pose0 = self.bridge.pose
+            self.gmap = GlobalOccupancyMap(
+                size_m=(20.0, 20.0), resolution_m=0.10,
+                origin_xy=(float(pose0[0]) - 10.0, float(pose0[1]) - 10.0),
+                map_id="cockpit_explore_%d" % int(time.time()), frame_id="odom")
+            self.gmap.set_waypoint("home", (pose0[0], pose0[1], pose0[3]))
+            self.controller = ExplorationController(
+                self.gmap,
+                ExplorationControllerConfig(
+                    max_speed_mps=0.20,
+                    max_yaw_rate_rps=0.45,
+                    inflation_radius_m=0.30,
+                    max_goal_step_m=2.0,
+                    frontier_standoff_m=0.25,
+                    progress_timeout_s=3.0,
+                    complete_confirmations=3,
+                ),
+                collision_guard=self.guard)
+            last_cloud_ts = -1.0
+            sensor_bad_since = None
+            self.detail = "LiDAR global mapを構築中…"
+            deploy_log("exploration_controller_start",
+                       target=self.exploration_target, map_id=self.gmap.map_id)
+
+            while self._run_is_active(run_id):
+                now_s = time.monotonic()
+                if not self.bridge.armed:
+                    self.abort("DISARMされた", expected_run_id=run_id)
+                    return
+                if now_s - self.t0 > MISSION_TIMEOUT_S:
+                    self.abort("探索タイムアウト(%ds)" % MISSION_TIMEOUT_S,
+                               expected_run_id=run_id)
+                    return
+                sensor = capture_autonomy_sensors(self.bridge)
+                err = autonomy_sensor_error(sensor, now_s)
+                if err:
+                    self._stop_command()
+                    self.safety = {"safe": False, "reason": err}
+                    self.detail = "センサ待機/停止: " + err
+                    sensor_bad_since = sensor_bad_since or now_s
+                    if now_s - sensor_bad_since > AUTONOMY_SENSOR_ABORT_S:
+                        self.abort("センサ異常が継続: " + err,
+                                   expected_run_id=run_id)
+                        return
+                    time.sleep(EXPLORATION_LOOP_S)
+                    continue
+                sensor_bad_since = None
+
+                pose = tuple(float(v) for v in sensor.pose[:4])
+                points = np.asarray(sensor.cloud_pts, dtype=np.float32)
+                cloud_ts = sensor.cloud_ts
+                now_ns = time.monotonic_ns()
+                if cloud_ts != last_cloud_ts:
+                    self.controller.integrate_point_cloud(
+                        pose, points, now_ns, max_range_m=8.0)
+                    last_cloud_ts = cloud_ts
+                    self.step += 1
+
+                ctl = self.controller.step(
+                    pose, now_ns, points_xyz=points,
+                    cloud_timestamp_s=cloud_ts,
+                    scan_valid=sensor.cloud_scan_valid,
+                    hazard=sensor.hazard)
+                self.last = {
+                    "action": ctl.status.value.lower(),
+                    "reason": ctl.reason,
+                    "vx": round(ctl.vx, 3), "wz": round(ctl.wz, 3),
+                    "goal": ([round(ctl.goal.x, 2), round(ctl.goal.y, 2)]
+                             if ctl.goal else None),
+                    "map_revision": ctl.map_revision,
+                }
+
+                if ctl.status is ControlStatus.COMPLETE:
+                    self._stop_command()
+                    self._run_flag = False
+                    self.status = "done"
+                    self.detail = "探索完了: 到達可能frontierなし(安定確認済み)"
+                    self.safety = {"safe": True, "reason": "active hold"}
+                    deploy_log("exploration_done", **self.controller.metrics())
+                    return
+
+                if ctl.moving:
+                    # controllerは10Hzで更新。更新停止時はbridge watchdogより前に失効。
+                    self._set_held_command((ctl.vx, ctl.vy, ctl.wz), 0.30)
+                    self.safety = {"safe": True, "reason": ctl.reason}
+                else:
+                    self._stop_command()
+                    if ctl.status is ControlStatus.STOP_SENSOR:
+                        self.safety = {"safe": False, "reason": ctl.reason}
+                    if ctl.status is ControlStatus.BLOCKED \
+                            and self.controller.blocked_cycles >= 20:
+                        self.abort("到達可能なfrontierがありません: " + ctl.reason,
+                                   expected_run_id=run_id)
+                        return
+                self.detail = ("探索 %s / %s / map=%s" %
+                               (ctl.status.value, ctl.reason, self.gmap.counts()))
+                time.sleep(EXPLORATION_LOOP_S)
+        except Exception as e:
+            if not self._run_is_active(run_id):
+                return
+            self._run_flag = False
+            self.status = "error"
+            self.detail = "探索エラー: %s" % (e,)
+            self._stop_command()
+            deploy_log("exploration_error", error=repr(e))
+
+    def _run_vlm(self, run_id=None):
         vlm = None
         tmpdir = tempfile.mkdtemp(prefix="go2_mission_")
         try:
             vlm = ClaudeCliVLM(self.model, cwd=tmpdir)
             last_note = "(開始直後)"
-            while self._run_flag:
+            while self._run_is_active(run_id):
                 if not self.bridge.armed:
-                    self.abort("DISARMされた")
+                    self.abort("DISARMされた", expected_run_id=run_id)
                     return
                 if time.monotonic() - self.t0 > MISSION_TIMEOUT_S:
-                    self.abort("タイムアウト(%ds)" % MISSION_TIMEOUT_S)
+                    self.abort("タイムアウト(%ds)" % MISSION_TIMEOUT_S,
+                               expected_run_id=run_id)
+                    return
+                sensor_error = autonomy_sensor_error(self.bridge)
+                if sensor_error:
+                    self.abort("センサ異常: " + sensor_error,
+                               expected_run_id=run_id)
                     return
                 self.step += 1
                 self.detail = "ステップ%d: 状況把握中…" % self.step
@@ -299,7 +678,7 @@ class MissionAgent:
                 t0 = time.time()
                 d = vlm.decide(prompt)
                 lat = time.time() - t0
-                if not self._run_flag:
+                if not self._run_is_active(run_id):
                     return
                 self.last = {"action": d["action"], "reason": d.get("reason", ""),
                              "vx": d.get("vx", 0), "wz": d.get("wz", 0),
@@ -309,20 +688,20 @@ class MissionAgent:
 
                 a = d["action"]
                 if a == "move":
-                    self._cur = (d["vx"], 0.0, d["wz"] * 0.5)
-                    self._hold_until = time.monotonic() + HOLD_MOVE_S
+                    self._set_held_command(
+                        (d["vx"], 0.0, d["wz"] * 0.5), HOLD_MOVE_S)
                     last_note = "move vx=%.2f wz=%.2f (%s)" % (d["vx"], d["wz"], d.get("reason", ""))
                 elif a == "turn":
-                    self._cur = (0.1, 0.0, d["wz"] if d["wz"] else 0.4)
-                    self._hold_until = time.monotonic() + HOLD_TURN_S
+                    # 見失い時の探索旋回へ前進を混ぜない。旧実装は正面の
+                    # 障害物へ0.1m/sで押し付ける経路になっていた。
+                    self._set_held_command(
+                        (0.0, 0.0, d["wz"] if d["wz"] else 0.4), HOLD_TURN_S)
                     last_note = "turn wz=%.2f (%s)" % (d["wz"], d.get("reason", ""))
                 elif a == "stop":
-                    self._cur = (0.0, 0.0, 0.0)
-                    self.bridge.set_cmd(0, 0, 0)
+                    self._stop_command()
                     last_note = "stop (%s)" % d.get("reason", "")
                 elif a == "done":
-                    self._cur = (0.0, 0.0, 0.0)
-                    self.bridge.set_cmd(0, 0, 0)
+                    self._stop_command()
                     self._run_flag = False
                     self.status = "done"
                     self.detail = "完了: " + d.get("reason", "")
@@ -330,12 +709,14 @@ class MissionAgent:
                     return
                 self.detail = "ステップ%d: %s実行中 (%s)" % (self.step, a, d.get("reason", ""))
         except Exception as e:
+            if not self._run_is_active(run_id):
+                return
             self._run_flag = False
             self.status = "error"
             self.detail = "エラー: %s" % (e,)
-            self._cur = (0.0, 0.0, 0.0)
-            self.bridge.set_cmd(0, 0, 0)
+            self._stop_command()
             deploy_log("mission_error", error=repr(e))
         finally:
             if vlm:
                 vlm.close()
+            shutil.rmtree(tmpdir, ignore_errors=True)

@@ -7,9 +7,9 @@ import math
 import unittest
 
 from contracts import ContractViolation
-from perception.global_map import GlobalOccupancyMap
+from perception.global_map import FREE, OCCUPIED, GlobalOccupancyMap
 from navigation.frontier_explorer import (
-    ExplorationStatus, next_goal,
+    ExplorationStatus, FrontierExplorer, next_goal,
 )
 
 
@@ -107,6 +107,94 @@ class TestExplorationLifecycle(unittest.TestCase):
         self.assertTrue(math.isfinite(d.goal.yaw))
         # 開口は東 → yaw はおおむね東向き(±90°)
         self.assertLess(abs(d.goal.yaw), math.pi / 2 + 0.2)
+
+
+class TestReachabilityAndHistory(unittest.TestCase):
+    def test_disconnected_free_island_is_not_returned_as_goal(self):
+        """UNKNOWN/壁越しの FREE 島は直線距離が近くても到達不能。"""
+        m = GlobalOccupancyMap(size_m=(6.0, 6.0), resolution_m=0.1,
+                               origin_xy=(-3.0, -3.0), map_id="islands")
+        # robot 周囲は既知 FREE だが OCCUPIED ring で閉じている。
+        m.grid[28:33, 28:33] = OCCUPIED
+        m.grid[29:32, 29:32] = FREE
+        # 1.4 m 先に大きな frontier を持つ分離 FREE 島。
+        m.grid[29:34, 44:49] = FREE
+        robot_xy = m.cell_to_world(30, 30)
+
+        d = next_goal(m, robot_xy, min_cluster_cells=5,
+                      inflate_cells=0, standoff_m=0.0,
+                      min_progress_m=0.1)
+
+        self.assertIs(d.status, ExplorationStatus.NO_REACHABLE_FRONTIER,
+                      d.reason)
+        self.assertIsNone(d.goal)
+
+    def test_astar_path_routes_through_door_instead_of_wall(self):
+        """goalへの直線が壁と交差しても、pathは開口を通る。"""
+        m = GlobalOccupancyMap(size_m=(10.0, 7.0), resolution_m=0.1,
+                               origin_xy=(0.0, 0.0), map_id="door_maze")
+        # 既知領域。右端だけ UNKNOWN に開いており frontier になる。
+        m.grid[10:61, 10:81] = FREE
+        m.grid[9, 9:82] = OCCUPIED
+        m.grid[61, 9:82] = OCCUPIED
+        m.grid[9:62, 9] = OCCUPIED
+        # x=45 の仕切り壁。y=29..41 のみ幅 1.3 m のドア。
+        m.grid[10:61, 45] = OCCUPIED
+        m.grid[29:42, 45] = FREE
+        robot_xy = m.cell_to_world(20, 20)
+
+        d = next_goal(m, robot_xy, min_cluster_cells=5,
+                      max_step_m=20.0, inflate_cells=2,
+                      standoff_m=0.0, min_progress_m=0.1)
+
+        self.assertIs(d.status, ExplorationStatus.GOAL, d.reason)
+        self.assertTrue(d.goal.path)
+        path_cells = [m.world_to_cell(*point) for point in d.goal.path]
+        self.assertLess(path_cells[0][0], 45)
+        self.assertGreater(path_cells[-1][0], 45)
+        door_crossings = [cell for cell in path_cells if cell[0] == 45]
+        self.assertTrue(door_crossings, path_cells)
+        self.assertTrue(all(29 <= y <= 41 for _, y in door_crossings),
+                        door_crossings)
+        self.assertTrue(all(m.grid[y, x] != OCCUPIED for x, y in path_cells))
+        # 開口へ迂回するので、計画 path は直線より長い。
+        self.assertGreater(d.goal.path_length_m, d.goal.distance_m + 0.2)
+
+    def test_small_frontier_is_not_misreported_as_complete(self):
+        m = GlobalOccupancyMap(size_m=(2.0, 2.0), resolution_m=0.1,
+                               origin_xy=(-1.0, -1.0), map_id="small_frontier")
+        m.grid[10:12, 10:12] = FREE  # 4 cells < default min_cluster_cells=5
+        robot_xy = m.cell_to_world(10, 10)
+
+        d = next_goal(m, robot_xy, min_cluster_cells=5,
+                      inflate_cells=0, standoff_m=0.0,
+                      min_progress_m=0.1)
+
+        self.assertIsNot(d.status, ExplorationStatus.COMPLETE, d.reason)
+        self.assertIs(d.status, ExplorationStatus.GOAL, d.reason)
+        self.assertLess(d.goal.frontier_cells, 5)
+        self.assertIn("small-frontier", d.reason)
+
+    def test_recent_and_failed_goal_is_not_immediately_reissued(self):
+        m = scan_room(make_map(), door=True)
+        explorer = FrontierExplorer(
+            m, inflation_radius_m=0.30, max_step_m=3.0,
+            standoff_m=0.35, failure_cooldown_plans=8)
+
+        first = explorer.plan((0.0, 0.0))
+        self.assertIs(first.status, ExplorationStatus.GOAL, first.reason)
+        failed_cell = first.goal.goal_cell
+        explorer.goal_failed()
+        second = explorer.plan((0.0, 0.0))
+
+        self.assertIs(second.status, ExplorationStatus.GOAL, second.reason)
+        self.assertNotEqual(second.goal.goal_cell, failed_cell)
+        # recent-goal penaltyの範囲(0.5 m)外へ切り替える。
+        separation = math.hypot(second.goal.goal_cell[0] - failed_cell[0],
+                                second.goal.goal_cell[1] - failed_cell[1]) \
+            * m.resolution_m
+        self.assertGreater(separation, 0.5)
+        self.assertEqual(explorer.goal_attempts[failed_cell], 1)
 
 
 if __name__ == "__main__":

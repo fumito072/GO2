@@ -44,16 +44,57 @@ class TestIntegrateScan(unittest.TestCase):
         near = m.world_to_cell(2.9, 0.0)
         end = m.world_to_cell(3.0, 0.0)
         self.assertEqual(m.grid[near[1], near[0]], FREE)
-        # max_range 端点は OCCUPIED にしない(その先は unknown のまま)
-        self.assertNotEqual(m.grid[end[1], end[0]], OCCUPIED)
+        # no-return beamはmax_range端点まで観測済みFREE。
+        self.assertEqual(m.grid[end[1], end[0]], FREE)
+
+    def test_explicit_miss_marks_endpoint_free(self):
+        m = make_map()
+        m.integrate_scan((0.0, 0.0), [(2.0, 0.0)], now_ns=1_000,
+                         hit_mask=[False])
+        end = m.world_to_cell(2.0, 0.0)
+        self.assertEqual(m.grid[end[1], end[0]], FREE)
+        self.assertEqual(m.counts()["occupied"], 0)
+
+    def test_outside_endpoint_keeps_in_map_free_ray(self):
+        m = GlobalOccupancyMap(size_m=(2.0, 2.0), resolution_m=0.1,
+                               origin_xy=(-1.0, -1.0))
+        m.integrate_scan((0.0, 0.0), [(5.0, 0.0)], now_ns=1_000,
+                         max_range_m=8.0)
+        near_edge = m.world_to_cell(0.95, 0.0)
+        self.assertEqual(m.grid[near_edge[1], near_edge[0]], FREE)
+        self.assertEqual(m.counts()["occupied"], 0)
+
+    def test_point_cloud_adapter_separates_floor_and_obstacle(self):
+        m = make_map()
+        # base z=.31 -> ground z=0。床returnはFREE、10cm箱はOCCUPIED。
+        pts = np.asarray([[1.0, 0.0, 0.0], [0.0, 1.0, 0.10]], np.float32)
+        m.integrate_point_cloud((0.0, 0.0, 0.31, 0.0), pts, now_ns=1_000)
+        floor = m.world_to_cell(1.0, 0.0)
+        box = m.world_to_cell(0.0, 1.0)
+        self.assertEqual(m.grid[floor[1], floor[0]], FREE)
+        self.assertEqual(m.grid[box[1], box[0]], OCCUPIED)
 
     def test_occupied_not_overwritten_by_free_ray(self):
-        # 保守側: 一度 OCCUPIED になった cell は通過 ray で FREE に戻さない
+        # 1回の矛盾観測では実壁を消さない。
         m = make_map()
         m.integrate_scan((0.0, 0.0), [(2.0, 0.0)], now_ns=1_000)
-        m.integrate_scan((0.0, 0.0), [(4.0, 0.0)], now_ns=2_000)
+        # 同じscanの多数rayでもevidenceは1回分。
+        m.integrate_scan((0.0, 0.0), [(4.0, 0.0)] * 20, now_ns=2_000,
+                         hit_mask=[False] * 20)
         wall = m.world_to_cell(2.0, 0.0)
         self.assertEqual(m.grid[wall[1], wall[0]], OCCUPIED)
+
+    def test_dynamic_obstacle_clears_after_three_independent_free_scans(self):
+        m = make_map()
+        wall = m.world_to_cell(2.0, 0.0)
+        m.integrate_scan((0.0, 0.0), [(2.0, 0.0)], now_ns=1_000)
+        for i in range(2):
+            m.integrate_scan((0.0, 0.0), [(4.0, 0.0)],
+                             now_ns=2_000 + i, hit_mask=[False])
+            self.assertEqual(m.grid[wall[1], wall[0]], OCCUPIED)
+        m.integrate_scan((0.0, 0.0), [(4.0, 0.0)],
+                         now_ns=3_000, hit_mask=[False])
+        self.assertEqual(m.grid[wall[1], wall[0]], FREE)
 
     def test_nan_points_ignored(self):
         m = make_map()
@@ -80,6 +121,32 @@ class TestSafetySemantics(unittest.TestCase):
         behind = m.world_to_cell(3.0, 0.0)
         self.assertFalse(trav[behind[1], behind[0]])
 
+    def test_stale_free_is_not_traversable(self):
+        m = make_map()
+        m.integrate_scan((0.0, 0.0), [(2.0, 0.0)], now_ns=1_000)
+        fresh = m.traversable_mask(inflate_cells=0, now_ns=1_500,
+                                   max_age_ns=1_000)
+        stale = m.traversable_mask(inflate_cells=0, now_ns=3_000,
+                                   max_age_ns=1_000)
+        c = m.world_to_cell(1.0, 0.0)
+        self.assertTrue(fresh[c[1], c[0]])
+        self.assertFalse(stale[c[1], c[0]])
+
+    def test_metric_inflation_is_resolution_independent(self):
+        for res in (0.05, 0.10):
+            with self.subTest(resolution=res):
+                m = GlobalOccupancyMap(size_m=(4.0, 4.0), resolution_m=res,
+                                       origin_xy=(-2.0, -2.0))
+                wall = m.world_to_cell(1.0, 0.0)
+                m.grid[wall[1], wall[0]] = OCCUPIED
+                near = m.world_to_cell(0.76, 0.0)
+                far = m.world_to_cell(0.55, 0.0)
+                m.grid[near[1], near[0]] = FREE
+                m.grid[far[1], far[0]] = FREE
+                trav = m.traversable_mask(inflation_radius_m=0.30)
+                self.assertFalse(trav[near[1], near[0]])
+                self.assertTrue(trav[far[1], far[0]])
+
     def test_inflation_blocks_near_wall(self):
         m = make_map()
         m.integrate_scan((0.0, 0.0), [(2.0, 0.0)], now_ns=1_000)
@@ -96,6 +163,10 @@ class TestSafetySemantics(unittest.TestCase):
         m.mark_hazard([(1.0, 0.0)], now_ns=2_000)
         c = m.world_to_cell(1.0, 0.0)
         self.assertEqual(m.grid[c[1], c[0]], OCCUPIED)
+        for i in range(5):
+            m.integrate_scan((0.0, 0.0), [(2.0, 0.0)],
+                             now_ns=3_000 + i, hit_mask=[False])
+        self.assertEqual(m.grid[c[1], c[0]], OCCUPIED)
 
 
 class TestPersistence(unittest.TestCase):
@@ -108,6 +179,8 @@ class TestPersistence(unittest.TestCase):
         m2 = GlobalOccupancyMap.from_dict(d)
         self.assertTrue(np.array_equal(m.grid, m2.grid))
         self.assertTrue(np.array_equal(m.age_ns, m2.age_ns))
+        self.assertTrue(np.array_equal(m.free_evidence, m2.free_evidence))
+        self.assertTrue(np.array_equal(m.hazard_mask, m2.hazard_mask))
         self.assertEqual(m2.waypoints["home"], (0.0, 0.0, 0.0))
 
     def test_from_dict_rejects_bad_cells(self):
