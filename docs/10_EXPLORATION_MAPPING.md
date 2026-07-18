@@ -89,3 +89,16 @@ provenance: {run_id, odom_source, git_commit}
 3. Mission FSM に EXPLORING/EXPLORATION_COMPLETE を追加(Gateway task と同時)
 4. map の保存/読込(`artifacts/maps/`)+ waypoint(home)登録
 5. cockpit UI へ map 可視化 layer(既存 UI 差分を保全して追加)
+
+## 8. 2026-07-18 実装更新
+
+初期baselineに存在した直線goal、探索履歴なし、VLM open-loop実機経路は置換した。
+現在はreachable frontier、inflate済みA* path、visit/failure履歴、progress timeout、
+cell freshness、独立local collision guardianを使用する。Cockpitの探索入力も
+`GlobalOccupancyMap → ExplorationController → guardian → RobotBridge`へ接続済み。
+
+原因、実装契約、全自動testとcollision付きE2Eの最新結果は
+[13_EXPLORATION_SAFETY_IMPLEMENTATION.md](13_EXPLORATION_SAFETY_IMPLEMENTATION.md)
+を正本とする。なお、設計上のCommand Arbiter/Exclusive Actuation Gatewayを
+Cockpit I/O adapterへ統合する作業は残るため、guardian/TTL/watchdogを外した状態を
+LIVE許可しない。

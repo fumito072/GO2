@@ -82,6 +82,7 @@ class CloudFrameGateTest(unittest.TestCase):
         bridge = RobotBridge.__new__(RobotBridge)
         bridge.pose = (0.0, 0.0, 0.31, 0.0)
         bridge.pose_src = "lidar_odom"
+        bridge.pose_ts = time.monotonic()
         bridge.cloud_pts = np.ones((1, 3), np.float32)  # 直前のvalid scan
         bridge.cloud_ts = time.monotonic()
         bridge.cloud_rx_ts = bridge.cloud_ts
@@ -102,7 +103,8 @@ class CloudFrameGateTest(unittest.TestCase):
         return bridge
 
     def test_sensor_frame_is_not_accumulated_or_inserted(self):
-        for frame_id in ("utlidar_lidar", "map", "not_odom", ""):
+        for frame_id in ("utlidar_lidar", "map", "not_odom", "",
+                         "odom/lidar", "map/odom", "fake/odom"):
             with self.subTest(frame_id=frame_id or "missing"):
                 bridge = self.make_bridge()
                 msg = pointcloud2(np.asarray(
@@ -157,7 +159,20 @@ class CloudFrameGateTest(unittest.TestCase):
         self.assertEqual(bridge.cloud_ui_n, 0)
         self.assertEqual(bridge.elev_inserted, [])
         self.assertIsNone(bridge.lidar_frame())
-        self.assertIn("pose未受信", bridge.cloud_error)
+        self.assertIn("robot_odom", bridge.cloud_error)
+
+    def test_stale_odom_pose_rejects_otherwise_valid_scan(self):
+        bridge = self.make_bridge()
+        bridge.pose_ts = time.monotonic() - 1.0
+        msg = pointcloud2(np.asarray(
+            [[0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0]], np.float32))
+        msg.header = SimpleNamespace(frame_id="odom")
+
+        bridge._on_cloud(msg)
+
+        self.assertFalse(bridge.cloud_scan_valid)
+        self.assertIsNone(bridge.lidar_frame())
+        self.assertIn("fresh", bridge.cloud_error)
 
 
 class MockSpatialSceneTest(unittest.TestCase):

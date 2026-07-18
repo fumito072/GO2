@@ -5,6 +5,8 @@
 map_frame)を stub bridge で検証する。
 """
 import struct
+import threading
+import time
 import unittest
 
 import numpy as np
@@ -33,7 +35,10 @@ class StubBridge:
         self.pose_ts = None
         self.pose_src = "mock"
         self.cloud_pts = None
+        self.cloud_ts = 0.0
         self.cloud_rx_ts = 0.0
+        self.cloud_frame = "odom"
+        self.cloud_scan_valid = False
         self.bot = StubBot()
         self.cmds = []
 
@@ -43,6 +48,51 @@ class StubBridge:
 
 def _task():
     return ExploreTask(StubBridge(), artifacts_dir="/tmp/test_explore_maps")
+
+
+class StubMission:
+    def __init__(self, error=None):
+        self.error = error
+        self.status = "idle"
+        self.detail = ""
+        self._run_flag = False
+        self.goal_spec = None
+        self.gmap = None
+        self.controller = None
+        self.last = {}
+        self.map_lock = threading.RLock()
+        self.started = []
+        self.aborted = []
+
+    def start_goal(self, spec, executive):
+        self.started.append((spec, executive))
+        if self.error:
+            return self.error
+        self.goal_spec = spec
+        self.status = "running"
+        self.detail = "安全探索中"
+        self._run_flag = True
+        return None
+
+    def abort(self, why):
+        self.aborted.append(why)
+        self._run_flag = False
+        self.status = "aborted"
+        self.detail = why
+
+
+def _ready_delegated_task(error=None):
+    bridge = StubBridge()
+    bridge.armed = True
+    now = time.monotonic()
+    bridge.pose_ts = now
+    bridge.cloud_ts = now
+    bridge.cloud_rx_ts = now
+    bridge.cloud_scan_valid = True
+    bridge.cloud_pts = np.zeros((24, 3), dtype=np.float32)
+    mission = StubMission(error)
+    return (ExploreTask(bridge, mission=mission,
+                        artifacts_dir="/tmp/test_explore_maps"), mission)
 
 
 class TestRouting(unittest.TestCase):
@@ -189,17 +239,62 @@ class TestStairIntegration(unittest.TestCase):
 
 
 class TestMapperBootstrap(unittest.TestCase):
-    def test_init_starts_mapper_thread(self):
-        # 回帰テスト(実機 2026-07-17 19:44-19:51 の「地図未初期化」):
-        # __init__ 末尾のマッパー起動がメソッド挿入で切り離され、
-        # スレッドが一度も起動しない状態になっていた
-        import threading
-        n0 = threading.active_count()
+    def test_facade_does_not_start_mapper_or_actuator_thread(self):
         t = _task()
-        self.assertIsNone(t._z_floor)          # __init__ で初期化されている
+        self.assertIsNone(t._z_floor)
         self.assertTrue(hasattr(t, "_map_lock"))
-        self.assertGreater(threading.active_count(), n0,
-                           "mapper スレッドが __init__ で起動していない")
+        self.assertIsNone(t._th)
+
+
+class TestSafeDelegate(unittest.TestCase):
+    def test_confirm_delegates_confirmed_goal_once_without_own_thread(self):
+        t, mission = _ready_delegated_task()
+        self.assertEqual(t.route_text("部屋を探索してマップを作って")["kind"],
+                         "proposal")
+
+        result = t.confirm()
+
+        self.assertEqual(result["kind"], "confirmed")
+        self.assertEqual(len(mission.started), 1)
+        self.assertEqual(mission.started[0][0].goal_id, result["goal_id"])
+        self.assertIsNone(t._th)
+        self.assertTrue(t._owns_delegate())
+
+    def test_delegate_rejection_is_propagated(self):
+        t, mission = _ready_delegated_task("runner busy")
+        t.route_text("部屋を探索してマップを作って")
+
+        result = t.confirm()
+
+        self.assertEqual(result["kind"], "error")
+        self.assertIn("runner busy", result["say"])
+        self.assertEqual(len(mission.started), 1)
+        self.assertFalse(t._run)
+
+    def test_stop_now_aborts_delegate_and_sends_zero(self):
+        t, mission = _ready_delegated_task()
+        t.route_text("部屋を探索してマップを作って")
+        t.confirm()
+
+        result = t.route_text("止まれ")
+
+        self.assertEqual(result["kind"], "stop_now")
+        self.assertTrue(mission.aborted)
+        self.assertEqual(t.bridge.cmds[-1], (0, 0, 0))
+
+    def test_map_frame_reads_the_delegated_controller_map(self):
+        t, mission = _ready_delegated_task()
+        mission.gmap = GlobalOccupancyMap(
+            size_m=(2.0, 2.0), resolution_m=0.1,
+            origin_xy=(-1.0, -1.0), map_id="delegated")
+        mission.gmap.mark_hazard([(0.0, 0.0)], now_ns=1)
+
+        buf = t.map_frame()
+
+        kind, _ox, _oy, res, w, h = struct.unpack("<BfffHH", buf[:17])
+        self.assertEqual(kind, BIN_EXPMAP)
+        self.assertAlmostEqual(res, 0.1)
+        self.assertEqual((w, h), (20, 20))
 
 
 if __name__ == "__main__":

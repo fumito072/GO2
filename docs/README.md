@@ -46,10 +46,13 @@
 | [08_SAFETY_TEST_EVALUATION.md](08_SAFETY_TEST_EVALUATION.md) | hazard、試験ラダー、KPI、受入条件 |
 | [09_DATA_AND_OPERATIONS.md](09_DATA_AND_OPERATIONS.md) | センサ記録、replay、モデル台帳、依存固定、運用 |
 | [10_EXPLORATION_MAPPING.md](10_EXPLORATION_MAPPING.md) | 自律探索とマップ構築(EXPLORE_AND_MAP)の設計(2026-07-15 目標再定義で追加) |
+| [10_LINGBOT_MAP_INTEGRATION_ASSESSMENT.md](10_LINGBOT_MAP_INTEGRATION_ASSESSMENT.md) | LingBot-Map の統合可否、sidecar 構成、GPU・座標・安全評価 |
 | [11_PROGRESS_AND_EDGE.md](11_PROGRESS_AND_EDGE.md) | 進捗サマリと現場エッジ機(RTX 3060 ノート)の要件・注意点 |
+| [12_EDGE_ONLY_INTEGRATION.md](12_EDGE_ONLY_INTEGRATION.md) | RTX 3060エッジ機上の音声・探索UI・センサ接続設計 |
+| [13_EXPLORATION_SAFETY_IMPLEMENTATION.md](13_EXPLORATION_SAFETY_IMPLEMENTATION.md) | 衝突・局所探索・再訪の原因、修正した実機経路、回帰試験、実機Gate |
 | [mermaid/README.md](mermaid/README.md) | 設計図のSVG/PNGプレビューとMermaid編集元 |
 
-推奨の読み順は `01 → 02 → 04 → 05 → 08`。研究選択の根拠は `03`、音声と学習の実装詳細は `06` と `07` に分けた。
+推奨の読み順は `01 → 02 → 04 → 05 → 08`。研究選択の根拠は `03`、音声と学習の実装詳細は `06` と `07` に分けた。LingBot-Map を camera-derived visual map 候補として評価する場合は `10` を参照する。
 
 ## 現在地の要約
 

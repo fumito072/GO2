@@ -95,19 +95,28 @@ class TestSelfFilter(unittest.TestCase):
         self.assertEqual(len(cc.drop_xy), 0)
         self.assertEqual(len(cc.floor_xy), 1)
 
-    def test_apply_cloud_clears_footprint(self):
-        # 事前に(誤って)ロボット直下に OCCUPIED があっても、apply_cloud の
-        # フットプリント浄化で FREE に戻る
+    def test_apply_cloud_never_clears_semantic_hazard(self):
+        # footprint浄化でもdrop/段差hazardは解除しない。
         m = _mk()
         c = m.world_to_cell(0.2, 0.0)
-        m.mark_hazard([(0.2, 0.0)], now_ns=1)   # hazard でも浄化される
+        m.mark_hazard([(0.2, 0.0)], now_ns=1)
         self.assertEqual(m.grid[c[1], c[0]], OCCUPIED)
         apply_cloud(m, (0, 0), _floor_patch(0.5, 1.0, -0.3, 0.3, z=0.0),
                     z_floor=0.0, now_ns=2)
-        self.assertEqual(m.grid[c[1], c[0]], FREE)
+        self.assertEqual(m.grid[c[1], c[0]], OCCUPIED)
 
 
 class TestApplyCloud(unittest.TestCase):
+    def test_obstacle_hit_wins_over_floor_ray_in_same_scan(self):
+        m = _mk()
+        pts = np.asarray([[1.0, 0.0, 0.0],
+                          [1.0, 0.0, Z_FLOOR_HI + 0.20]])
+
+        apply_cloud(m, (0, 0), pts, z_floor=0.0, now_ns=1)
+
+        cell = m.world_to_cell(1.0, 0.0)
+        self.assertEqual(m.grid[cell[1], cell[0]], OCCUPIED)
+
     def test_floor_only_carves_free_no_occupied(self):
         m = _mk()
         pts = _floor_patch(-1.0, 2.0, -1.0, 1.0, z=0.0)
@@ -187,9 +196,8 @@ class TestFreeClearance(unittest.TestCase):
         back = free_clearance(m, 0.0, 0.0, math.pi, max_m=5.0, inflate_cells=0)
         self.assertLess(fwd, back + 0.01)
 
-    def test_optimistic_counts_unknown(self):
-        # 床を 1m 分だけ観測。既定は unknown で止まるが、optimistic は
-        # 未踏域を数える(探索計画専用 — 操作者要望 2026-07-17)
+    def test_legacy_optimistic_clearance_remains_free_only(self):
+        # 旧引数を指定してもLIVE clearanceはunknownを通行距離に数えない。
         m = _mk()
         apply_cloud(m, (0, 0), _floor_patch(0.1, 1.0, -0.3, 0.3, z=0.0),
                     z_floor=0.0, now_ns=1)
@@ -197,7 +205,7 @@ class TestFreeClearance(unittest.TestCase):
         d_opt = free_clearance(m, 0.0, 0.0, 0.0, max_m=5.0, inflate_cells=0,
                                optimistic=True)
         self.assertLess(d_def, 1.2)
-        self.assertAlmostEqual(d_opt, 5.0, delta=0.1)
+        self.assertAlmostEqual(d_opt, d_def, delta=1e-9)
 
     def test_optimistic_still_stops_before_wall(self):
         # optimistic でも観測済み障害物(+inflate)では従来どおり止まる

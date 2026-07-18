@@ -32,7 +32,9 @@ sys.path.insert(0, __file__.rsplit("cockpit", 1)[0])
 from common import config  # noqa: E402
 from common.go2_iface import make_robot, SDK_JOINT_NAMES  # noqa: E402
 from common.safety import deploy_log  # noqa: E402
-from cockpit.mission import DEFAULT_MODEL, MissionAgent  # noqa: E402
+from cockpit.mission import (  # noqa: E402
+    DEFAULT_MODEL, MissionAgent, classify_exploration_request,
+)
 from cockpit.rl_bridge import RlController  # noqa: E402
 from cockpit.stair import detect_stair  # noqa: E402
 from cockpit.stair_task import StairTask  # noqa: E402
@@ -65,7 +67,7 @@ class RobotBridge:
         self.elev = RollingElevationMap(size_m=8.0, res=0.05)
         self.pose = None          # (x,y,z,yaw) odom系
         self.pose_src = "none"
-        self.pose_ts = None       # pose 最終更新(monotonic)。探索の fail-closed 判定用
+        self.pose_ts = 0.0        # robot_odom callback受信 monotonic時刻
         self.cloud_pts = None     # 直近点群 (N,3) odom系
         self.cloud_ts = 0.0
         self.cloud_rx_ts = 0.0
@@ -243,7 +245,9 @@ class RobotBridge:
     def _is_world_cloud_frame(frame):
         """robot_odom poseと同じodom frameか。map等は変換がないため許可しない。"""
         name = str(frame or "").strip("/\x00").lower()
-        return name == "odom" or name.startswith("odom/") or name.endswith("/odom")
+        # prefix/suffix許可は fake/odom, map/odom, odom/lidar まで誤受理する。
+        # 実機で確認済みの cloud_deskewed 契約は frame_id=odom の完全一致。
+        return name == "odom"
 
     def _warn_cloud(self, message):
         """LiDAR callbackを止めず、同じ警告は最大2秒に1回だけ出す。"""
@@ -295,23 +299,19 @@ class RobotBridge:
             self._warn_cloud("finiteなXYZ点が0件です (frame=%s)" % self.cloud_frame)
             return
 
-        # lidar_odomが未着なら従来どおりSportModeStateを試す。ただしpose無しの
-        # scanを無制限でworldへ蓄積しない（-14m級外れ値が永久に残るため）。
-        if self.pose_src != "lidar_odom":
-            st = self.bot.state()
-            if "pos" in st:
-                q = st.get("quat", [1, 0, 0, 0])
-                self.pose = (st["pos"][0], st["pos"][1], st["pos"][2],
-                             quat_to_yaw(q[0], q[1], q[2], q[3]))
-                self.pose_src = "sms"
-                self.pose_ts = time.monotonic()
-                self._update_vel(*self.pose[:3])
-        if self.pose is None:
+        # odom cloudとSportModeState poseは原点/時刻の同一性が保証されない。
+        # robot_odomがfreshでないscanをworld mapへ混ぜずfail-closedにする。
+        pose_age = time.monotonic() - float(getattr(self, "pose_ts", 0.0) or 0.0)
+        if self.pose is None or self.pose_src != "lidar_odom" \
+                or pose_age < 0 or pose_age > 0.6:
             self.cloud_ui_n = 0
             self.cloud_elev_n = 0
             self.cloud_scan_valid = False
             self.cloud_bounds = None
-            self._warn_cloud("pose未受信のためscanを保留しました (frame=%s)" % self.cloud_frame)
+            self._warn_cloud(
+                "freshなrobot_odom poseがないためscanを破棄しました "
+                "(frame=%s pose_src=%s age=%.3fs)" %
+                (self.cloud_frame, self.pose_src, pose_age))
             return
 
         ui_pts = self._filter_cloud_ui(raw_pts)
@@ -539,22 +539,44 @@ class RobotBridge:
 
     def set_cmd(self, vx, vy, wz):
         lim = config.VEL_LIMIT
+        try:
+            values = (float(vx), float(vy), float(wz))
+        except (TypeError, ValueError):
+            values = (float("nan"),) * 3
+        valid = all(math.isfinite(v) for v in values)
         with self._lock:
-            self.cmd = [max(lim["vx"][0], min(lim["vx"][1], float(vx))),
-                        max(lim["vy"][0], min(lim["vy"][1], float(vy))),
-                        max(lim["wz"][0], min(lim["wz"][1], float(wz)))]
+            if valid:
+                self.cmd = [
+                    max(lim["vx"][0], min(lim["vx"][1], values[0])),
+                    max(lim["vy"][0], min(lim["vy"][1], values[1])),
+                    max(lim["wz"][0], min(lim["wz"][1], values[2])),
+                ]
+            else:
+                # NaNはPythonのmin/maxで上限値へ化け得る。非有限/変換不能は
+                # clampせず、必ずzero commandへ倒す。
+                self.cmd = [0.0, 0.0, 0.0]
             self.cmd_ts = time.monotonic()
+        if not valid:
+            try:
+                self.bot.stop_move()
+            except Exception:
+                pass
+            deploy_log("cockpit_cmd_rejected", reason="non-finite command")
+        return valid
 
     def set_armed(self, on: bool):
+        valid = isinstance(on, bool)
+        on = on if valid else False
         with self._lock:
-            self.armed = bool(on)
+            self.armed = on
             self.cmd = [0.0, 0.0, 0.0]
         if not on:
             try:
                 self.bot.stop_move()
             except Exception:
                 pass
-        deploy_log("cockpit_arm", on=bool(on))
+        deploy_log("cockpit_arm", on=on, valid=valid)
+        return valid
 
     def do_action(self, name: str) -> str:
         """stop/damp はARM不問。姿勢系はARM時のみ。"""
@@ -601,6 +623,7 @@ class RobotBridge:
              "cmd": [round(v, 2) for v in self.cmd],
              "low_age_ms": round(st.get("low_age", 1e9) * 1e3, 1),
              "pose_src": self.pose_src,
+             "pose_age": round(now - self.pose_ts, 3) if self.pose_ts else None,
              "cloud_hz": round(self.cloud_hz, 1),
              "cloud_age": round(now - self.cloud_ts, 2) if self.cloud_ts else None,
              "cloud_rx_age": round(now - self.cloud_rx_ts, 2) if self.cloud_rx_ts else None,
@@ -672,6 +695,11 @@ def build_app(bridge: RobotBridge, transcriber: Transcriber = None,
             rl.stop(why)
         if explore is not None:
             explore.abort(why)
+
+    def stair_busy():
+        return getattr(stair, "state", "idle") in (
+            "starting", "scan", "align", "approach", "confirm",
+            "climb", "settle", "handoff")
 
     def _asset_ver(name):
         try:
@@ -808,10 +836,23 @@ def build_app(bridge: RobotBridge, transcriber: Transcriber = None,
                     continue
                 t = d.get("type")
                 if t == "cmd":
-                    bridge.set_cmd(d.get("vx", 0), d.get("vy", 0), d.get("wz", 0))
+                    try:
+                        cmd = (float(d.get("vx", 0)), float(d.get("vy", 0)),
+                               float(d.get("wz", 0)))
+                    except (TypeError, ValueError):
+                        cmd = (float("nan"), 0.0, 0.0)
+                    if not all(math.isfinite(v) for v in cmd):
+                        abort_autonomy("invalid manual command")
+                        bridge.set_cmd(0, 0, 0)
+                        continue
+                    if any(abs(v) > 1e-9 for v in cmd):
+                        # 手動入力は明示的override。自律keeperとのlast-write-winsを
+                        # 許さず、全世代を失効・zero化してから手動commandを適用。
+                        abort_autonomy("manual override")
+                    bridge.set_cmd(*cmd)
                 elif t == "arm":
                     on = d.get("on", False)
-                    if not on:
+                    if not isinstance(on, bool) or not on:
                         abort_autonomy("DISARM")
                     bridge.set_armed(on)
                     await ws.send_str(json.dumps({"type": "ack", "what": "arm",
@@ -824,13 +865,25 @@ def build_app(bridge: RobotBridge, transcriber: Transcriber = None,
                     await ws.send_str(json.dumps({"type": "ack", "what": name,
                                                   "result": r}))
                 elif t == "mission":
+                    instruction = d.get("instruction", "")
                     if mission is None:
                         err = "無効です"
-                    elif explore is not None and explore.status == "running":
-                        err = "自律探索の実行中です(先に探索を停止してください)"
+                        what = "mission"
+                    elif (classify_exploration_request(instruction) is not None
+                          and explore is not None):
+                        # AI MISSION欄からの探索も同じproposal/confirm経路へ統一。
+                        err = explore.route_text(instruction, modality="ui")
+                        what = "explore"
+                    elif stair_busy():
+                        err = "段差タスクの実行中です(先に停止してください)"
+                        what = "mission"
+                    elif rl is not None and rl.is_running():
+                        err = "RL方策の実行中です(先に停止してください)"
+                        what = "mission"
                     else:
-                        err = mission.start(d.get("instruction", ""))
-                    await ws.send_str(json.dumps({"type": "ack", "what": "mission",
+                        err = mission.start(instruction)
+                        what = "mission"
+                    await ws.send_str(json.dumps({"type": "ack", "what": what,
                                                   "result": err or "ok"}))
                 elif t == "mission_stop":
                     if mission is not None:
@@ -840,7 +893,7 @@ def build_app(bridge: RobotBridge, transcriber: Transcriber = None,
                 elif t == "stair_start":
                     if stair is None:
                         err = "無効です"
-                    elif explore is not None and explore.status == "running":
+                    elif mission is not None and mission.status == "running":
                         err = "自律探索の実行中です(先に探索を停止してください)"
                     else:
                         if mission is not None:
@@ -861,7 +914,7 @@ def build_app(bridge: RobotBridge, transcriber: Transcriber = None,
                 elif t == "rl_start":   # 手動でRL方策だけ起動(登坂タスクを介さない)
                     if rl is None:
                         err = "RLバックエンドが無効です"
-                    elif explore is not None and explore.status == "running":
+                    elif mission is not None and mission.status == "running":
                         # 探索(自動登坂含む)と RL 方策の二重駆動を防ぐ
                         err = "自律探索の実行中です(先に探索を停止してください)"
                     else:
@@ -975,7 +1028,7 @@ def main():
     mission = MissionAgent(bridge, model=args.vlm_model or DEFAULT_MODEL)
     rl = RlController(bridge)
     stair = StairTask(bridge, vlm_model=args.vlm_model or DEFAULT_MODEL, rl=rl)
-    explore = ExploreTask(bridge, stair_task=stair)  # 探索中の自動登坂に使用
+    explore = ExploreTask(bridge, stair_task=stair, mission=mission)
     # 自律系の相互排他: AI任務/段差タスクの実行中は探索開始を拒否
     # (stair_task の属性は state。"status" ではない — 2026-07-18 修正)
     _STAIR_BUSY = ("starting", "scan", "align", "approach", "confirm",

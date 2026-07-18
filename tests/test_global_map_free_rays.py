@@ -65,14 +65,19 @@ class TestIntegrateFreeRays(unittest.TestCase):
         n = m.integrate_free_rays((0.0, 0.0),
                                   [(float("nan"), 0.0), (float("inf"), 1.0)],
                                   now_ns=1)
-        self.assertEqual(n, 0)
+        # 不正rayは無視するが、robotが実在するcellはFREEへ更新される。
+        self.assertLessEqual(n, 1)
+        self.assertEqual(m.counts()["occupied"], 0)
 
-    def test_out_of_map_ray_ignored(self):
+    def test_out_of_map_ray_preserves_observed_free_cells_to_boundary(self):
         m = _mk()
-        # 地図外(>5m)の点は integrate_scan と同じく MVP では無視
+        # endpointが地図外でも、そこまで実際に通ったrayを捨てない。
         n = m.integrate_free_rays((0.0, 0.0), [(20.0, 0.0)], now_ns=1,
                                   max_range_m=30.0)
-        self.assertEqual(n, 0)
+        self.assertGreater(n, 0)
+        edge = m.world_to_cell(4.95, 0.0)
+        self.assertEqual(m.grid[edge[1], edge[0]], FREE)
+        self.assertEqual(m.counts()["occupied"], 0)
 
     def test_bad_now_ns_rejected(self):
         m = _mk()

@@ -14,6 +14,8 @@ import uuid
 from dataclasses import dataclass
 from typing import Optional
 
+import numpy as np
+
 from contracts.command_envelope import (
     ArbiterPriority, CommandEnvelope, LocomotionBackend, RequestedMode,
     ServerAttribution,
@@ -25,7 +27,9 @@ from contracts.goal_spec import (
 from contracts.stop_states import StopState
 from mission.command_arbiter import CommandArbiter, DirectiveKind
 from mission.executive import AffordanceContext, MissionExecutive, MissionState
-from navigation.frontier_explorer import ExplorationStatus, next_goal
+from navigation.exploration_controller import (
+    ControlStatus, ExplorationController, ExplorationControllerConfig,
+)
 from perception.global_map import GlobalOccupancyMap, FREE
 from realtime.exclusive_actuation_gateway import (
     ActionKind, Channel, ExclusiveActuationGateway, RobotStatusFlags,
@@ -57,8 +61,13 @@ class E2EResult:
     steps: int
     map_counts: dict
     room_b_mapped: bool
+    room_b_entered: bool
     robot_xy: tuple
     narrative: list
+    collision_count: int
+    coverage_ratio: float
+    unique_visited_cells: int
+    revisit_ratio: float
 
 
 def _confirm_proposal(prop: GoalProposal, ids: _Ids) -> GoalSpec:
@@ -145,18 +154,33 @@ def run_e2e(utterance: str = "部屋を探索してマップを作って",
                               origin_xy=(-8.0, -6.0), map_id="e2e_map")
     gmap.set_waypoint("home", (start_xy[0], start_xy[1], 0.0))
     pos = [float(start_xy[0]), float(start_xy[1])]
+    yaw = 0.0
+    controller = ExplorationController(
+        gmap,
+        ExplorationControllerConfig(
+            max_speed_mps=speed_mps,
+            max_yaw_rate_rps=0.5,
+            inflation_radius_m=0.30,
+            max_goal_step_m=2.0,
+            frontier_standoff_m=0.20,
+            free_max_age_s=120.0,
+            progress_timeout_s=3.0,
+        ))
     flags = RobotStatusFlags(settled_below_thresholds=True,
                              stable_contact_verified=True)
     seq = 0
-    goal = None
     completed = False
     stopped = False
     steps = 0
+    collision_count = 0
+    entered_room_b = False
 
     for step in range(max_steps):
         steps = step + 1
         t = tick_ns(int(dt_s * 1000))
-        gmap.integrate_scan(tuple(pos), world.scan(pos), now_ns=t)
+        points, hits = world.scan_with_hits(pos, n_rays=120, max_range=2.2)
+        controller.integrate_planar_scan(tuple(pos), points, now_ns=t,
+                                         max_range_m=2.2, hit_mask=hits)
 
         # 操作者の途中停止(試験注入)
         if stop_after_steps is not None and step == stop_after_steps:
@@ -187,53 +211,64 @@ def run_e2e(utterance: str = "部屋を探索してマップを作って",
             narrative.append("step %d: 「止まれ」→ STOP_NOW latch" % step)
 
         if not stopped and execu.state is MissionState.EXPLORING:
-            # goal 更新(未設定 or 到達)
-            if goal is None or math.hypot(goal.x - pos[0], goal.y - pos[1]) < 0.15:
-                d = next_goal(gmap, tuple(pos))
-                if d.status is ExplorationStatus.COMPLETE:
-                    execu.notify_completion(
-                        spec.completion.predicate, tick_ns())
-                    completed = True
-                    narrative.append("step %d: frontier 枯渇 → %s"
-                                     % (step, execu.state.name))
-                    break
-                if d.status is ExplorationStatus.GOAL:
-                    goal = d.goal
-                else:
-                    narrative.append("step %d: %s(%s)" % (step, d.status.name, d.reason))
-                    goal = None
-            if goal is not None:
-                dx, dy = goal.x - pos[0], goal.y - pos[1]
-                n = math.hypot(dx, dy)
-                vx = speed_mps * dx / n if n > 1e-9 else 0.0
-                vy = speed_mps * dy / n if n > 1e-9 else 0.0
-                vy = max(-0.5, min(0.5, vy))
-                seq += 1
-                env = CommandEnvelope(
-                    schema_version="1.0", source_id="frontier_explorer",
-                    goal_id=spec.goal_id, actuation_request_id=ids(),
-                    sender_timestamp=t, sequence=seq, expires_after_ms=500,
-                    requested_mode=RequestedMode.COMMON_NAV,
-                    vx=round(vx, 4), vy=round(vy, 4), wz=0.0,
-                    phase="EXPLORE", policy_hash="not_applicable")
-                arb.submit(env, ServerAttribution(
-                    trusted_source_id="frontier_explorer",
-                    priority=ArbiterPriority.NAV_LOCAL_PLANNER,
-                    accepted_monotonic_timestamp_ns=t), t)
+            ctl = controller.step((pos[0], pos[1], 0.31, yaw), t)
+            if ctl.status is ControlStatus.COMPLETE:
+                execu.notify_completion(spec.completion.predicate, tick_ns())
+                completed = True
+                narrative.append("step %d: frontier 枯渇を安定確認 → %s"
+                                 % (step, execu.state.name))
+            elif ctl.status in (ControlStatus.STOP_REPLAN,
+                                ControlStatus.STOP_SENSOR):
+                narrative.append("step %d: safety stop: %s" % (step, ctl.reason))
+            seq += 1
+            env = CommandEnvelope(
+                schema_version="1.0", source_id="frontier_explorer",
+                goal_id=spec.goal_id, actuation_request_id=ids(),
+                sender_timestamp=t, sequence=seq, expires_after_ms=300,
+                requested_mode=RequestedMode.COMMON_NAV,
+                vx=round(ctl.vx, 4), vy=round(ctl.vy, 4), wz=round(ctl.wz, 4),
+                phase="EXPLORE", policy_hash="not_applicable")
+            arb.submit(env, ServerAttribution(
+                trusted_source_id="frontier_explorer",
+                priority=ArbiterPriority.NAV_LOCAL_PLANNER,
+                accepted_monotonic_timestamp_ns=t), t)
 
         act = gw.tick(flags, tick_ns())
         if act.kind is ActionKind.FORWARD:
-            # kinematic sim: 世界座標で速度を積分(点 robot)
-            pos[0] += act.envelope.vx * dt_s
-            pos[1] += act.envelope.vy * dt_s
+            # Sport Moveと同じbody-frame commandをyaw込みで積分する。
+            old = tuple(pos)
+            yaw_mid = yaw + 0.5 * act.envelope.wz * dt_s
+            yaw = (yaw + act.envelope.wz * dt_s + math.pi) % (2 * math.pi) - math.pi
+            nx = pos[0] + (act.envelope.vx * math.cos(yaw_mid)
+                           - act.envelope.vy * math.sin(yaw_mid)) * dt_s
+            ny = pos[1] + (act.envelope.vx * math.sin(yaw_mid)
+                           + act.envelope.vy * math.cos(yaw_mid)) * dt_s
+            if world.motion_collides(old, (nx, ny), robot_radius=0.22):
+                collision_count += 1
+                # simulatorは壁を通さない。count>0ならE2E testを失敗させる。
+            else:
+                pos[0], pos[1] = nx, ny
+        entered_room_b = entered_room_b or pos[0] > 0.35
+        if completed:
+            break
 
     room_b = gmap.world_to_cell(1.5, 0.0)
     room_b_mapped = bool(gmap.grid[room_b[1], room_b[0]] == FREE)
+    # 外周壁内を対象areaとし、map全体の未知領域でcoverageを薄めない。
+    x0, y0 = gmap.world_to_cell(-2.8, -1.8)
+    x1, y1 = gmap.world_to_cell(2.8, 1.8)
+    roi = gmap.grid[y0:y1 + 1, x0:x1 + 1]
+    coverage = float(np.mean(roi != 0))
+    metrics = controller.metrics()
     return E2EResult(
         completed=completed, stopped_by_operator=stopped,
         final_mission_state=execu.state, steps=steps,
         map_counts=gmap.counts(), room_b_mapped=room_b_mapped,
-        robot_xy=(round(pos[0], 3), round(pos[1], 3)), narrative=narrative)
+        room_b_entered=entered_room_b,
+        robot_xy=(round(pos[0], 3), round(pos[1], 3)), narrative=narrative,
+        collision_count=collision_count, coverage_ratio=coverage,
+        unique_visited_cells=metrics["unique_cells"],
+        revisit_ratio=metrics["revisit_ratio"])
 
 
 def _ascii_map(gmap: GlobalOccupancyMap, every: int = 4) -> str:
@@ -254,6 +289,9 @@ def main():
     print("completed=%s state=%s steps=%d pos=%s" %
           (r.completed, r.final_mission_state.name, r.steps, r.robot_xy))
     print("map: %s / room_b_mapped=%s" % (r.map_counts, r.room_b_mapped))
+    print("coverage=%.1f%% collisions=%d unique=%d revisit=%.3f" %
+          (100 * r.coverage_ratio, r.collision_count,
+           r.unique_visited_cells, r.revisit_ratio))
 
 
 if __name__ == "__main__":

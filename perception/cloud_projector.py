@@ -21,7 +21,7 @@ from typing import NamedTuple
 
 import numpy as np
 
-from perception.global_map import GlobalOccupancyMap
+from perception.global_map import FREE, OCCUPIED, GlobalOccupancyMap
 
 # z 帯しきい値 [m](z_floor 相対)。安全側以外の変更は根拠と test を伴うこと。
 Z_FLOOR_LO = -0.08
@@ -100,19 +100,24 @@ def apply_cloud(gmap: GlobalOccupancyMap, robot_xy, points_xyz,
                 max_range_m: float = MAP_MAX_RANGE_M) -> dict:
     """点群1フレームを地図へ統合する。戻り値は統計 dict(ログ用)。
 
-    順序が重要: 障害物ray → 床ray → drop hazard → 自機フットプリント。
-    hazard は ray 減衰の対象外なので drop は以後のフレームでも保持される。
-    最後の clear_footprint は「ロボットが物理的に立っている」という
-    最強の通行可能証拠で、自己反射由来の幻 OCCUPIED/hazard を浄化する。
+    floor/obstacleを同一scanとして一度に統合し、同じcellではhitを優先する。
+    drop hazardはray/footprintでは解除せず、明示的map resetまで保持する。
     """
     cc = classify_cloud(points_xyz, robot_xy, z_floor,
                         gmap.resolution_m, max_range_m)
-    n_occ = gmap.integrate_scan(robot_xy, cc.obstacle_xy, now_ns,
-                                max_range_m=max_range_m)
-    n_free = gmap.integrate_free_rays(robot_xy, cc.floor_xy, now_ns,
-                                      max_range_m=max_range_m)
+    before = gmap.grid.copy()
+    points = np.vstack((cc.floor_xy, cc.obstacle_xy))
+    hit_mask = np.concatenate((
+        np.zeros(len(cc.floor_xy), dtype=bool),
+        np.ones(len(cc.obstacle_xy), dtype=bool),
+    ))
+    gmap.integrate_scan(robot_xy, points, now_ns,
+                        max_range_m=max_range_m, hit_mask=hit_mask)
     gmap.mark_hazard(cc.drop_xy, now_ns)
     gmap.clear_footprint(robot_xy, FOOTPRINT_R_M, now_ns)
+    after = gmap.grid
+    n_occ = int(np.count_nonzero((before != OCCUPIED) & (after == OCCUPIED)))
+    n_free = int(np.count_nonzero((before != FREE) & (after == FREE)))
     return {"floor_pts": int(len(cc.floor_xy)),
             "obstacle_pts": int(len(cc.obstacle_xy)),
             "drop_pts": int(len(cc.drop_xy)),
@@ -127,8 +132,8 @@ def clearance_multi(gmap: GlobalOccupancyMap, x: float, y: float,
     ルンバ風スムーズ操舵(2026-07-18)用: 毎tick 9方向を測るため、
     free_clearance を方向数だけ呼ぶと mask 構築が支配的になる。
     戻り値: headings と同順のクリアランス [m] のリスト。"""
-    trav = gmap.traversable_mask(inflate_cells=inflate_cells,
-                                 optimistic=optimistic)
+    # optimistic引数は旧API互換で受理するが、移動clearanceは常にFREE-only。
+    trav = gmap.traversable_mask(inflate_cells=inflate_cells)
     step = gmap.resolution_m * 0.5
     n = int(max_m / step)
     out = []
@@ -153,13 +158,11 @@ def free_clearance(gmap: GlobalOccupancyMap, x: float, y: float, yaw: float,
     waypoint_follower の front_clearance 入力。
     - optimistic=False(既定): FREE のみ数える。unknown はクリアランスに
       数えない(invariant 9)。
-    - optimistic=True: 非OCCUPIED を数える(探索計画専用。未踏域へ踏み出す
-      ため。障害物/hazard/inflation では従来どおり止まる)。
+    - optimistic=Trueは旧API互換。安全上、結果は既定と同じFREE-only。
     ロボット自身の cell が通行不可でも、直前までの距離(=0)を返すだけで
     例外にはしない。
     """
-    trav = gmap.traversable_mask(inflate_cells=inflate_cells,
-                                 optimistic=optimistic)
+    trav = gmap.traversable_mask(inflate_cells=inflate_cells)
     step = gmap.resolution_m * 0.5
     n = int(max_m / step)
     cx, cy = math.cos(yaw), math.sin(yaw)
