@@ -5,6 +5,44 @@ Sport歩容(純正)の速度コマンドをキーボード/ボタンで送る統
 
 ## 起動
 
+### Apple Silicon Mac
+
+初回だけ、リポジトリ直下でMac用の固定環境を作る:
+
+```bash
+scripts/setup_macos.sh
+```
+
+実機を動かさず、状態・カメラ・LiDAR・ハイトマップ・UIを確認する:
+
+```bash
+GO2_IFACE=en10 .venv/bin/python -m m0_teleop.check_robot --video --lidar
+COCKPIT_NO_VOICE=1 cockpit/launch.sh --real --read-only
+```
+
+`--read-only`ではUIのARMがLOCKEDになり、移動・姿勢・DAMP・LowCmdと
+LiDAR keepalive publishをサーバ側で遮断する。確認後、周囲を無人にして物理E-stopを
+手元に置いた場合だけ通常実機モードを使う:
+
+```bash
+cockpit/launch.sh --real       # 起動直後はDISARM
+cockpit/launch.sh --stop
+```
+
+Macランチャーは`.venv/bin/python`、`route -n get`によるNIC検出、Chrome/Safariの
+`open`に対応する。既定bindは`127.0.0.1`で、LANへ無認証公開しない。
+
+検証済み境界（2026-07-18）:
+
+- LowState / SportModeState / 前面カメラ / LiDAR点群 / LiDAR odom: Mac実機で受信成功
+- Cockpit WebSocket / 点群表示: Mac実機で確認
+- Sport Move / StopMoveの実走: 安全な無人スペース未確保のため未実施
+- 音声: 依存導入・importまで。初回実機確認は`COCKPIT_NO_VOICE=1`を推奨
+- LowCmd / RL LIVE: Mac実機未検証のためNo-Go（dry-runのみ）
+- NaVILA 8B/CUDA: Mac単体対象外。Linux/5090サーバを利用
+
+### Linuxデスクトップ
+
 **デスクトップの「GO2 コックピット」アイコンをダブルクリック**するだけ
 (またはアクティビティ検索で "GO2")。サーバが未起動なら自動起動し、
 Chromeのアプリウィンドウで開く。アイコン右クリックで「Mockモードで起動」「サーバ停止」。
@@ -19,6 +57,7 @@ cd ~/development/real_mac_GO2
 cockpit/launch.sh              # 自動判定(ロボットが居れば実機/居なければMockを提案)
 cockpit/launch.sh --mock       # 常にMock
 cockpit/launch.sh --real       # 常に実機(繋がらなければエラー)
+cockpit/launch.sh --real --read-only # 実機センサのみ・全actuator遮断
 cockpit/launch.sh --stop       # サーバ停止
 python3 -m cockpit.server --mock                # サーバのみ直接起動
 GO2_IFACE=enp46s0 python3 -m cockpit.server     # 実機・NIC明示
@@ -26,15 +65,17 @@ GO2_IFACE=enp46s0 python3 -m cockpit.server     # 実機・NIC明示
 環境変数: `COCKPIT_PORT`(既定8080) / `COCKPIT_NO_BROWSER=1`(サーバのみ) / `GO2_IP` / `GO2_IFACE` /
 `GO2_LIDAR_CLOUD_TOPIC` / `GO2_LIDAR_ODOM_TOPIC`
 
-ブラウザで **http://localhost:8080** (同一LANの別PCからは `http://<このPCのIP>:8080`)。
-サーバログ: `/tmp/go2_cockpit.log`
+ランチャー利用時はブラウザで **http://localhost:8080**。安全のため`127.0.0.1`だけに
+bindし、同一LANの別PCからもアクセスできない。`cockpit.server`を直接起動した場合の既定は
+`0.0.0.0`だが、認証機能がないため信頼できないLAN以外へ公開しないこと。
+サーバログ: `/tmp/go2_cockpit_8080.log`（ポート番号ごとに分離）
 関連ファイル: `cockpit/launch.sh` / `~/.local/share/applications/go2-cockpit.desktop` /
 `~/デスクトップ/go2-cockpit.desktop` / アイコン `cockpit/static/icon.png`
 
 ## ネットワーク要件(実機モード)
 
 実機モードは **Unitree SDKのDDS通信**を使うため、**ロボットに到達できるNICが必須**。
-「サーバ起動失敗」の大半はここが原因(`/tmp/go2_cockpit.log` に
+「サーバ起動失敗」の大半はここが原因(`/tmp/go2_cockpit_8080.log` に
 `does not match an available interface` / `channel factory init error` が出る)。
 
 チェック順:

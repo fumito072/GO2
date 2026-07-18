@@ -1,7 +1,7 @@
 # real_mac_GO2 — ロボット側PC(Ethernet直結)の依存
-# python 3.10+ 推奨。unitree_sdk2py は git から:
-#   pip install git+https://github.com/unitreerobotics/unitree_sdk2_python.git
-# (cyclonedds のビルドが必要な場合は同リポジトリREADME参照)
+# python 3.10+ 推奨。実機SDKは requirements-macos.txt または検証済みrevisionから:
+#   pip install 'cyclonedds==0.10.2'
+#   pip install 'git+https://github.com/unitreerobotics/unitree_sdk2_python.git@e4cd91f051aaa77a70600e3d2bf7f50889db1980'
 numpy
 opencv-python
 aiohttp          # cockpit HTTP/WebSocket server

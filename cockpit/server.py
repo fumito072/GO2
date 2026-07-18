@@ -49,6 +49,40 @@ BIN_LIDAR = 1      # [u8 type][u32 n][f32 x,y,z ×n]  odom系
 BIN_HEIGHTMAP = 2  # [u8 type][f32 cx][f32 cy][f32 res][u16 n][f32 h n*n] NaN=未観測
 
 
+class _ReadOnlyRobot:
+    """Expose sensor methods while making every actuator path inert.
+
+    This is deliberately a narrow proxy rather than a UI-only DISARM flag: it
+    also blocks direct ``bridge.bot`` calls from autonomy cleanup paths.
+    """
+
+    def __init__(self, robot):
+        self._robot = robot
+
+    def state(self):
+        return self._robot.state()
+
+    def get_frame(self):
+        return self._robot.get_frame()
+
+    def stop_move(self):
+        # No command was ever allowed, so a remote StopMove RPC is unnecessary.
+        return None
+
+    @staticmethod
+    def _blocked(*_args, **_kwargs):
+        raise RuntimeError("read-only mode: actuator command blocked")
+
+    move = _blocked
+    damp = _blocked
+    stand_up = _blocked
+    stand_down = _blocked
+    balance_stand = _blocked
+    release_sport_mode = _blocked
+    restore_sport_mode = _blocked
+    low_publisher = _blocked
+
+
 class RobotBridge:
     """ロボット(実機/Mock)と各センサの集約。コマンドは専用スレッドで10Hz送信。"""
 
@@ -61,9 +95,14 @@ class RobotBridge:
     ELEV_CLOUD_Z_BELOW_M = 1.5
     ELEV_CLOUD_Z_ABOVE_M = 1.0
 
-    def __init__(self, mock: bool, publish_hs: bool = True):
+    def __init__(self, mock: bool, publish_hs: bool = True,
+                 read_only: bool = False):
         self.mock = mock
-        self.bot = make_robot(mock=mock)
+        self.read_only = bool(read_only)
+        # クラスをランチャー以外から直接使ってもREAD ONLYの不変条件を保つ。
+        self.publish_hs = bool(publish_hs) and not self.read_only
+        raw_bot = make_robot(mock=mock)
+        self.bot = _ReadOnlyRobot(raw_bot) if self.read_only else raw_bot
         self.elev = RollingElevationMap(size_m=8.0, res=0.05)
         self.pose = None          # (x,y,z,yaw) odom系
         self.pose_src = "none"
@@ -105,7 +144,7 @@ class RobotBridge:
         threading.Thread(target=self._cam_loop, daemon=True).start()
         threading.Thread(target=self._cmd_loop, daemon=True).start()
         threading.Thread(target=self._stair_loop, daemon=True).start()
-        if publish_hs:
+        if self.publish_hs:
             threading.Thread(target=self._hs_loop, daemon=True).start()
 
     # ---------- 段差検出 (5Hz) ----------
@@ -167,16 +206,17 @@ class RobotBridge:
         # LiDAR keepalive(実機 2026-07-18 03:02: cloud_deskewed が途中で配信
         # 停止 → rt/utlidar/switch に ON を送ると復旧した)。ON は冪等な
         # センサ有効化コマンドなので5秒毎に送り続けて再発を防ぐ
-        try:
-            from unitree_sdk2py.core.channel import ChannelPublisher
-            from unitree_sdk2py.idl.std_msgs.msg.dds_ import String_
-            self._lidar_sw = ChannelPublisher("rt/utlidar/switch", String_)
-            self._lidar_sw.Init()
-            self._lidar_sw_msg = String_
-            threading.Thread(target=self._lidar_keepalive,
-                             daemon=True).start()
-        except Exception as e:
-            print("[cockpit] LiDAR keepalive初期化失敗(%r)" % (e,))
+        if not self.read_only:
+            try:
+                from unitree_sdk2py.core.channel import ChannelPublisher
+                from unitree_sdk2py.idl.std_msgs.msg.dds_ import String_
+                self._lidar_sw = ChannelPublisher("rt/utlidar/switch", String_)
+                self._lidar_sw.Init()
+                self._lidar_sw_msg = String_
+                threading.Thread(target=self._lidar_keepalive,
+                                 daemon=True).start()
+            except Exception as e:
+                print("[cockpit] LiDAR keepalive初期化失敗(%r)" % (e,))
 
     def _lidar_keepalive(self):
         while True:
@@ -544,6 +584,14 @@ class RobotBridge:
         except (TypeError, ValueError):
             values = (float("nan"),) * 3
         valid = all(math.isfinite(v) for v in values)
+        if getattr(self, "read_only", False):
+            with self._lock:
+                self.cmd = [0.0, 0.0, 0.0]
+                self.cmd_ts = time.monotonic()
+            blocked = valid and any(abs(v) > 1e-12 for v in values)
+            if blocked:
+                deploy_log("cockpit_cmd_rejected", reason="read-only mode")
+            return valid and not blocked
         with self._lock:
             if valid:
                 self.cmd = [
@@ -567,6 +615,13 @@ class RobotBridge:
     def set_armed(self, on: bool):
         valid = isinstance(on, bool)
         on = on if valid else False
+        if getattr(self, "read_only", False) and on:
+            with self._lock:
+                self.armed = False
+                self.cmd = [0.0, 0.0, 0.0]
+            deploy_log("cockpit_arm", on=False, valid=False,
+                       reason="read-only mode")
+            return False
         with self._lock:
             self.armed = on
             self.cmd = [0.0, 0.0, 0.0]
@@ -584,6 +639,8 @@ class RobotBridge:
         gated = {"stand_up", "stand_down", "balance_stand"}
         if name not in always | gated:
             return "unknown action"
+        if getattr(self, "read_only", False):
+            return "READ ONLYモードでは実機コマンドを送信しません"
         if name in gated and not self.armed:
             return "DISARM中は実行できません(ARMしてください)"
         with self._lock:
@@ -619,7 +676,8 @@ class RobotBridge:
         else:
             cloud_status = "ok"
         t = {"type": "telemetry", "ts": time.time(),
-             "mock": self.mock, "armed": self.armed,
+             "mock": self.mock, "read_only": self.read_only,
+             "armed": self.armed,
              "cmd": [round(v, 2) for v in self.cmd],
              "low_age_ms": round(st.get("low_age", 1e9) * 1e3, 1),
              "pose_src": self.pose_src,
@@ -1015,10 +1073,18 @@ def main():
                     help="ミッション用claudeモデル (既定 claude-sonnet-5 / 高速なのは haiku)")
     ap.add_argument("--no-publish-hs", action="store_true",
                     help="height_scan(187点)のUDP配信を止める(既定は配信=RL方策の目になる)")
+    ap.add_argument("--read-only", action="store_true",
+                    help="実機センサだけを表示し、全actuator/LiDAR publishを遮断")
     args = ap.parse_args()
+    if args.mock and args.read_only:
+        ap.error("--read-only is for real sensors and cannot be combined with --mock")
 
     try:
-        bridge = RobotBridge(mock=args.mock, publish_hs=not args.no_publish_hs)
+        # READ ONLYではrobot向けDDSだけでなく、既存の外部RL processを
+        # 刺激し得るローカルheight-scan UDPも起動しない。
+        bridge = RobotBridge(mock=args.mock,
+                             publish_hs=not args.no_publish_hs and not args.read_only,
+                             read_only=args.read_only)
     except Exception as e:
         print("[cockpit] ロボット接続失敗: %s" % (e,))
         print("  - LANケーブル・ロボットの電源・GO2_IFACE(現在:'%s')を確認してください" % config.NET_IFACE)
@@ -1040,12 +1106,16 @@ def main():
         if getattr(stair, "state", "idle") in _STAIR_BUSY else
         "RL方策の実行中です(先に停止してください)"
         if rl is not None and rl.is_running() else None)
-    deploy_log("cockpit_start", mock=args.mock, port=args.port)
+    deploy_log("cockpit_start", mock=args.mock, read_only=args.read_only,
+               port=args.port)
     from aiohttp import web
     app = build_app(bridge, transcriber, mission, stair, rl, explore)
     print("=" * 60)
     print(" Go2 COCKPIT  →  http://localhost:%d  (mock=%s)" % (args.port, args.mock))
-    print("   起動直後はDISARM。UIのARMスイッチONで操縦可能になります。")
+    if args.read_only:
+        print("   READ ONLY: 実機センサのみ。ARM/移動/姿勢/LowCmdはすべて遮断します。")
+    else:
+        print("   起動直後はDISARM。UIのARMスイッチONで操縦可能になります。")
     print("=" * 60)
     web.run_app(app, host=args.host, port=args.port, print=None)
 

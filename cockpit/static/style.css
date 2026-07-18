@@ -139,6 +139,8 @@ body::before {
 }
 #mode-badge.mock { background: rgba(255, 173, 10, .08); color: var(--warn); }
 #mode-badge.real { background: rgba(89, 239, 131, .09); color: var(--safe); }
+#mode-badge.readonly { background: rgba(53, 216, 255, .10); color: var(--accent); }
+body.read-only .arm-switch { opacity: .72; cursor: not-allowed; }
 
 .topbar-actions {
   display: flex;

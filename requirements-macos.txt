@@ -1,0 +1,9 @@
+-c constraints-macos.txt
+-r requirements.txt
+
+# Unitree SDK2 currently requires this DDS ABI.  CPython 3.10 has a native
+# macOS ARM64 wheel, so no Rosetta or Linux VM is required.
+cyclonedds==0.10.2
+
+# Pin the exact Unitree revision verified against this Cockpit and a real GO2.
+unitree_sdk2py @ git+https://github.com/unitreerobotics/unitree_sdk2_python.git@e4cd91f051aaa77a70600e3d2bf7f50889db1980

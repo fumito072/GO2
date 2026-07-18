@@ -48,6 +48,8 @@ let ws = null;
 let telem = {};
 let pose = null;          // [x,y,z,yaw]
 let armed = false;
+let readOnly = false;
+let readOnlyLogged = false;
 let hmap = null;          // {cx, cy, res, n, data(Float32Array)}
 let stair = null;         // 段差検出結果
 let expmap = null;        // {ox, oy, res, w, h, cells(Uint8Array)} 占有格子
@@ -118,10 +120,18 @@ function onAck(d) {
 function onTelemetry(d) {
   telem = d;
   if (d.pose) pose = d.pose;
-  if (d.armed !== armed) setArmedUI(d.armed);
+  const readOnlyChanged = readOnly !== Boolean(d.read_only);
+  readOnly = Boolean(d.read_only);
+  if (d.armed !== armed || readOnlyChanged) setArmedUI(d.armed);
 
-  $("mode-badge").textContent = d.mock ? "MOCK" : "REAL";
-  $("mode-badge").className = "stat " + (d.mock ? "mock" : "real");
+  $("mode-badge").textContent = d.mock ? "MOCK" : (readOnly ? "REAL / VIEW" : "REAL");
+  $("mode-badge").className = "stat " + (d.mock ? "mock" : (readOnly ? "readonly" : "real"));
+  document.body.classList.toggle("read-only", readOnly);
+  $("arm-toggle").disabled = readOnly;
+  if (readOnly && !readOnlyLogged) {
+    readOnlyLogged = true;
+    log("READ ONLY — 実機コマンドはサーバ側で遮断されています", "ok");
+  }
   $("batt").textContent = d.battery != null ? d.battery.toFixed(1) : "--";
   $("lowage").textContent = d.low_age_ms != null && d.low_age_ms < 1e6 ? d.low_age_ms.toFixed(0) : "--";
   $("cloudhz").textContent = d.cloud_hz != null ? d.cloud_hz.toFixed(1) : "--";
@@ -180,8 +190,9 @@ function onTelemetry(d) {
 function setArmedUI(on) {
   armed = on;
   $("arm-toggle").checked = on;
+  $("arm-toggle").disabled = readOnly;
   const lb = $("arm-label");
-  lb.textContent = on ? "ARMED" : "DISARMED";
+  lb.textContent = readOnly ? "LOCKED" : (on ? "ARMED" : "DISARMED");
   lb.className = "arm-label" + (on ? " armed" : "");
   document.body.classList.toggle("disarmed", !on);
 }
@@ -1137,6 +1148,10 @@ function stopAll() {
 }
 
 function hintIfDisarmed() {
+  if (readOnly) {
+    log("READ ONLYモードです — 実機操作は無効です", "ok");
+    return true;
+  }
   if (armed) return false;
   if (Date.now() - disarmHintAt > 2500) {
     disarmHintAt = Date.now();

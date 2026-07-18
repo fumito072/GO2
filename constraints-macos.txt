@@ -1,0 +1,14 @@
+# Verified on Apple Silicon / macOS 26.5 / CPython 3.10.
+#
+# OpenCV 5 + PyAV 17 both bundle AVFoundation classes on macOS.  Importing
+# them in the same Cockpit process emits duplicate Objective-C class warnings
+# and can crash.  Keep the combination below, which is exercised by the Mac
+# setup and Cockpit smoke tests.
+numpy==1.26.4
+opencv-python==4.10.0.84
+aiohttp==3.13.1
+torch==2.3.1
+av==12.0.0
+ctranslate2==4.6.0
+onnxruntime==1.18.0
+faster-whisper==1.2.1

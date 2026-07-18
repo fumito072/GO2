@@ -7,7 +7,8 @@ import os
 
 # ---------- ネットワーク ----------
 # Go2 とEthernet直結したときのPC側インタフェース名。
-# Windows例: "イーサネット" / Linux例: "enp2s0" / 空文字ならDDSのデフォルト。
+# macOS例: "en10" / Windows例: "イーサネット" / Linux例: "enp2s0" /
+# 空文字ならDDSのデフォルト。複数NICのMacでは必ず明示する。
 NET_IFACE = os.environ.get("GO2_IFACE", "")
 # Go2 本体のIP（既定 192.168.123.161）。PC側は 192.168.123.x/24 に静的設定する。
 GO2_IP = os.environ.get("GO2_IP", "192.168.123.161")

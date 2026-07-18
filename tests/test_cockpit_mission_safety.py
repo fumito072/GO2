@@ -19,7 +19,7 @@ from cockpit.mission import (
     autonomy_sensor_error,
     classify_exploration_request,
 )
-from cockpit.server import RobotBridge
+from cockpit.server import RobotBridge, _ReadOnlyRobot
 from navigation.exploration_controller import ControlStatus
 
 
@@ -324,6 +324,48 @@ class ServerCommandValidationTest(unittest.TestCase):
             self.assertFalse(bridge.set_armed("true"))
         self.assertFalse(bridge.armed)
         self.assertEqual(bridge.cmd, [0.0, 0.0, 0.0])
+
+    def test_read_only_mode_rejects_arm_motion_and_actions(self):
+        bridge = self.make_bridge()
+        bridge.read_only = True
+        with patch("cockpit.server.deploy_log"):
+            self.assertFalse(bridge.set_cmd(0.1, 0.0, 0.0))
+            self.assertTrue(bridge.set_cmd(0.0, 0.0, 0.0))
+            self.assertFalse(bridge.set_armed(True))
+        self.assertFalse(bridge.armed)
+        self.assertEqual(bridge.cmd, [0.0, 0.0, 0.0])
+        self.assertIn("READ ONLY", bridge.do_action("damp"))
+        bridge.bot.stop_move.assert_not_called()
+
+    def test_read_only_robot_proxy_never_delegates_actuators(self):
+        raw = SimpleNamespace(
+            state=Mock(return_value={"low_age": 0.01}),
+            get_frame=Mock(return_value=b"frame"),
+            move=Mock(), stop_move=Mock(), damp=Mock(),
+        )
+        robot = _ReadOnlyRobot(raw)
+        self.assertEqual(robot.state(), {"low_age": 0.01})
+        self.assertEqual(robot.get_frame(), b"frame")
+        self.assertIsNone(robot.stop_move())
+        with self.assertRaisesRegex(RuntimeError, "read-only"):
+            robot.move(0.1, 0.0, 0.0)
+        with self.assertRaisesRegex(RuntimeError, "read-only"):
+            robot.damp()
+        raw.move.assert_not_called()
+        raw.stop_move.assert_not_called()
+        raw.damp.assert_not_called()
+
+    def test_read_only_constructor_never_starts_height_scan_publisher(self):
+        raw = SimpleNamespace()
+        with patch("cockpit.server.make_robot", return_value=raw), \
+                patch("cockpit.server.threading.Thread") as thread_cls:
+            bridge = RobotBridge(mock=True, publish_hs=True, read_only=True)
+        try:
+            targets = [call.kwargs.get("target") for call in thread_cls.call_args_list]
+            self.assertFalse(bridge.publish_hs)
+            self.assertNotIn(bridge._hs_loop, targets)
+        finally:
+            bridge._cmd_sock.close()
 
 
 class _SafeGuard:

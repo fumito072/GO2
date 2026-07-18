@@ -26,6 +26,28 @@
    python -m m3_rl.rl_stair_controller --mock --dry-run --hs elev --yes # RLループ
    ```
 
+### Apple Silicon Mac（実機接続確認済み）
+
+MacではCPython 3.10のネイティブ環境を使う。2026-07-18にApple Silicon Macから
+GO2実機のLowState / SportModeState / 1920×1080カメラ / `cloud_deskewed`点群 /
+`robot_odom`を`en10`経由で受信確認済み。
+
+```bash
+scripts/setup_macos.sh
+
+# 状態・カメラ・LiDARを購読するだけ（移動命令なし）
+GO2_IFACE=en10 .venv/bin/python -m m0_teleop.check_robot --video --lidar
+
+# 実センサUI。サーバ側で全actuator commandを遮断
+COCKPIT_NO_VOICE=1 cockpit/launch.sh --real --read-only
+```
+
+Macで検証済みなのはCockpitの高レベルSport状態受信とセンサ受信まで。SportのMove/StopMoveを
+含む実走テストは、安全な無人スペースを確保できていないため未実施。LowCmd/RLのLIVE実機制御も
+非リアルタイムOS上のジッタを含む実機検証が未完了なので、Macでは現時点No-Goとする。
+`--dry-run`とCPU方策推論は動作確認済み。NaVILA 8B/CUDAサーバはLinux/5090側へ置き、
+Mac Cockpitからネットワーク利用する。
+
 ## M0 — テレオペと純正実力測定（数日）
 ```bash
 python -m m0_teleop.check_robot --video      # 接続確認(LowState/カメラ)
